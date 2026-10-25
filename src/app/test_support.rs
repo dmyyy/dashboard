@@ -66,9 +66,14 @@ pub(crate) fn empty_app() -> App {
         projects: Vec::new(),
         recent_projects: RecentProjects::default(),
         bookmarked_projects: BookmarkedProjects::default(),
+        discovering_projects: false,
+        discovery_generation: 0,
+        discovery_cancel: None,
+        discovery_seen: HashSet::new(),
         background_tx,
         background_rx,
         background_limiter: Arc::new(Semaphore::new(8)),
+        size_limiter: Arc::new(Semaphore::new(1)),
         events: EventHandler::for_test(),
     }
 }

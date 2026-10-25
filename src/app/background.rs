@@ -1,4 +1,4 @@
-use super::projects::directory_size;
+use super::projects::{Project, directory_size, sort_projects};
 use super::providers::{
     CiRunsData, LanguagesData, ProjectMetadataSummary, discover_ci_runs, discover_languages,
     discover_project_metadata, git_status,
@@ -17,10 +17,21 @@ pub enum BackgroundResult {
     Targets(PathBuf, Vec<Target>),
     ProjectCreated(Option<PathBuf>),
     ProjectCleaned(PathBuf),
+    ProjectsDiscovered {
+        generation: u64,
+        projects: Vec<Project>,
+    },
+    ProjectDiscoveryFinished {
+        generation: u64,
+    },
 }
 impl App {
-    pub(super) fn drain_background_results(&mut self) {
-        while let Ok(result) = self.background_rx.try_recv() {
+    pub(super) fn drain_background_results(&mut self) -> bool {
+        let mut projects_changed = false;
+        for _ in 0..64 {
+            let Ok(result) = self.background_rx.try_recv() else {
+                break;
+            };
             match result {
                 BackgroundResult::Metadata(path, metadata) => {
                     self.loading_metadata.remove(&path);
@@ -65,26 +76,58 @@ impl App {
                         self.mark_project_opened(project_path);
                     }
                     self.reload_projects();
-                    if let Some(project_path) = project_path {
-                        if let Some(index) =
-                            self.filtered_projects.iter().position(|&project_index| {
-                                self.projects
-                                    .get(project_index)
-                                    .is_some_and(|project| project.path == project_path)
-                            })
-                        {
-                            self.cursor = index as isize;
-                            self.refresh_targets();
-                        }
-                    }
                 }
                 BackgroundResult::ProjectCleaned(path) => {
                     self.size_cache.remove(&path);
                     self.loading_sizes.remove(&path);
                     self.request_size(path);
                 }
+                BackgroundResult::ProjectsDiscovered {
+                    generation,
+                    projects,
+                } if generation == self.discovery_generation => {
+                    for project in projects {
+                        self.discovery_seen.insert(project.path.clone());
+                        if let Some(existing) = self
+                            .projects
+                            .iter_mut()
+                            .find(|existing| existing.path == project.path)
+                        {
+                            *existing = project;
+                            continue;
+                        }
+                        self.inject_project(project.clone());
+                        self.projects.push(project);
+                        projects_changed = true;
+                    }
+                }
+                BackgroundResult::ProjectDiscoveryFinished { generation }
+                    if generation == self.discovery_generation =>
+                {
+                    let selected_path = self.current_project().map(|project| project.path.clone());
+                    self.discovering_projects = false;
+                    self.projects
+                        .retain(|project| self.discovery_seen.contains(&project.path));
+                    sort_projects(&mut self.projects, &self.recent_projects);
+                    self.rebuild_project_matcher();
+                    if let Some(selected_path) = selected_path {
+                        self.cursor = self
+                            .filtered_projects
+                            .iter()
+                            .position(|&index| {
+                                self.projects
+                                    .get(index)
+                                    .is_some_and(|project| project.path == selected_path)
+                            })
+                            .map_or(-1, |index| index as isize);
+                    }
+                    projects_changed = true;
+                }
+                BackgroundResult::ProjectsDiscovered { .. }
+                | BackgroundResult::ProjectDiscoveryFinished { .. } => {}
             }
         }
+        projects_changed
     }
 
     pub(super) fn request_current_project_metadata(&mut self) {
@@ -109,18 +152,29 @@ impl App {
     }
 
     pub(super) fn request_visible_project_data(&mut self) {
-        let visible_paths: Vec<_> = self
-            .visible_projects()
-            .take(8)
-            .map(|project| project.path.clone())
-            .collect();
-
-        for path in visible_paths {
+        if self.discovering_projects || !self.loading_sizes.is_empty() {
+            return;
+        }
+        if let Some(project) = self.current_project() {
+            if !self.size_cache.contains_key(&project.path) {
+                self.request_size(project.path.clone());
+                return;
+            }
+        }
+        let next_path = {
+            self.visible_projects()
+                .map(|project| project.path.clone())
+                .find(|path| !self.size_cache.contains_key(path))
+        };
+        if let Some(path) = next_path {
             self.request_size(path);
         }
     }
 
     pub(super) fn request_visible_git_statuses(&mut self) {
+        if self.discovering_projects {
+            return;
+        }
         let visible_paths: Vec<_> = self
             .visible_projects()
             .take(16)
@@ -132,16 +186,6 @@ impl App {
         }
     }
 
-    pub(super) fn request_all_project_sizes(&mut self) {
-        let project_paths: Vec<_> = self
-            .projects
-            .iter()
-            .map(|project| project.path.clone())
-            .collect();
-        for path in project_paths {
-            self.request_size(path);
-        }
-    }
 
     pub(super) fn request_next_git_status_batch(&mut self, batch_size: usize) {
         if self.projects.is_empty() {
@@ -204,7 +248,7 @@ impl App {
         }
 
         let tx = self.background_tx.clone();
-        let limiter = self.background_limiter.clone();
+        let limiter = self.size_limiter.clone();
         tokio::spawn(async move {
             let Ok(_permit) = limiter.acquire_owned().await else {
                 return;

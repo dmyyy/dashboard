@@ -23,13 +23,23 @@ pub(super) fn render_projects(frame: &mut Frame, app: &mut App, area: Rect) {
     });
     let visible_rows = inner.height.saturating_sub(1) as usize;
     let scroll_offset = project_scroll_offset(app, visible_rows);
+    let title = if app.discovering_projects {
+        "Projects (discovering…)"
+    } else {
+        "Projects"
+    };
 
     if app.filtered_projects.is_empty() {
+        let message = if app.discovering_projects {
+            "Discovering projects…"
+        } else {
+            "No matching projects"
+        };
         frame.render_widget(
-            Paragraph::new("No matching projects")
+            Paragraph::new(message)
                 .block(
                     Block::bordered()
-                        .title("Projects")
+                        .title(title)
                         .title_alignment(Alignment::Center)
                         .border_type(BorderType::Rounded)
                         .border_style(pane_border_style(focused)),
@@ -124,7 +134,7 @@ pub(super) fn render_projects(frame: &mut Frame, app: &mut App, area: Rect) {
             )
             .block(
                 Block::bordered()
-                    .title("Projects")
+                    .title(title)
                     .title_alignment(Alignment::Center)
                     .border_type(BorderType::Rounded)
                     .border_style(pane_border_style(focused)),

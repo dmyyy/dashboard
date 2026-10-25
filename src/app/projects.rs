@@ -5,6 +5,10 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -86,29 +90,56 @@ impl App {
     }
 
     pub(super) fn reload_projects(&mut self) {
-        let selected_path = self.current_project().map(|project| project.path.clone());
-        self.projects = discover_projects(&self.projects_root);
-        sort_projects(&mut self.projects, &self.recent_projects);
-        self.rebuild_project_matcher();
-
-        if let Some(selected_path) = selected_path {
-            if let Some(index) = self.filtered_projects.iter().position(|&project_index| {
-                self.projects
-                    .get(project_index)
-                    .is_some_and(|project| project.path == selected_path)
-            }) {
-                self.cursor = index as isize;
-                self.refresh_targets();
-                return;
-            }
+        if let Some(cancel) = &self.discovery_cancel {
+            cancel.store(true, Ordering::Relaxed);
         }
 
-        self.cursor = if self.filtered_projects.is_empty() {
-            -1
-        } else {
-            0
-        };
-        self.refresh_targets();
+        self.discovery_generation = self.discovery_generation.wrapping_add(1);
+        self.discovering_projects = true;
+        self.discovery_seen.clear();
+        let generation = self.discovery_generation;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let root = self.projects_root.clone();
+        let recent_projects = self.recent_projects.clone();
+        let tx = self.background_tx.clone();
+        let completion_tx = tx.clone();
+
+        // Runs filesystem traversal off the UI thread and publishes small batches.
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let mut batch = Vec::new();
+                let mut emitted = 0usize;
+                let completed = discover_projects_streaming(
+                    &root,
+                    &recent_projects,
+                    &cancelled,
+                    |project| {
+                        batch.push(project);
+                        emitted += 1;
+                        if emitted == 1 || batch.len() >= 16 {
+                            tx.send(BackgroundResult::ProjectsDiscovered {
+                                generation,
+                                projects: std::mem::take(&mut batch),
+                            })
+                            .is_ok()
+                        } else {
+                            true
+                        }
+                    },
+                );
+                if completed && !batch.is_empty() {
+                    let _ = tx.send(BackgroundResult::ProjectsDiscovered {
+                        generation,
+                        projects: batch,
+                    });
+                }
+                completed
+            })
+            .await;
+            if matches!(result, Ok(true)) {
+                let _ = completion_tx.send(BackgroundResult::ProjectDiscoveryFinished { generation });
+            }
+        });
     }
 
     pub(super) fn toggle_selected_project_bookmark(&mut self) {
@@ -289,20 +320,27 @@ fn unix_timestamp_now() -> u64 {
 }
 
 pub(super) fn sort_projects(projects: &mut [Project], recent_projects: &RecentProjects) {
-    projects.sort_by(|a, b| {
-        let a_key = a.path.to_string_lossy();
-        let b_key = b.path.to_string_lossy();
-        let a_recent = recent_projects.entries.get(a_key.as_ref()).copied();
-        let b_recent = recent_projects.entries.get(b_key.as_ref()).copied();
+    projects.sort_by(|a, b| compare_projects(a, b, recent_projects));
+}
 
-        b_recent
-            .cmp(&a_recent)
-            .then_with(|| match (a_recent, b_recent) {
-                (None, None) => b.has_git_dir.cmp(&a.has_git_dir),
-                _ => std::cmp::Ordering::Equal,
-            })
-            .then_with(|| a.name.cmp(&b.name))
-    });
+pub(super) fn compare_projects(
+    a: &Project,
+    b: &Project,
+    recent_projects: &RecentProjects,
+) -> std::cmp::Ordering {
+    let a_key = a.path.to_string_lossy();
+    let b_key = b.path.to_string_lossy();
+    let a_recent = recent_projects.entries.get(a_key.as_ref()).copied();
+    let b_recent = recent_projects.entries.get(b_key.as_ref()).copied();
+
+    b_recent
+        .cmp(&a_recent)
+        .then_with(|| match (a_recent, b_recent) {
+            (None, None) => b.has_git_dir.cmp(&a.has_git_dir),
+            _ => std::cmp::Ordering::Equal,
+        })
+        .then_with(|| a.name.cmp(&b.name))
+        .then_with(|| a.path.cmp(&b.path))
 }
 
 pub(super) fn projects_root() -> PathBuf {
@@ -322,71 +360,213 @@ pub(super) fn expand_tilde(path: PathBuf) -> PathBuf {
     path
 }
 
+#[cfg(test)]
 pub(super) fn discover_projects(root: &Path) -> Vec<Project> {
+    let cancelled = AtomicBool::new(false);
     let mut projects = Vec::new();
-    let mut seen = HashSet::new();
-    visit_dirs(root, &mut projects, &mut seen);
+    let _ = discover_projects_streaming(
+        root,
+        &RecentProjects::default(),
+        &cancelled,
+        |project| {
+            projects.push(project);
+            true
+        },
+    );
     projects
 }
 
-fn visit_dirs(dir: &Path, projects: &mut Vec<Project>, seen: &mut HashSet<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
+// Streams validated recents before traversing the remaining project tree.
+pub(super) fn discover_projects_streaming(
+    root: &Path,
+    recent_projects: &RecentProjects,
+    cancelled: &AtomicBool,
+    mut emit: impl FnMut(Project) -> bool,
+) -> bool {
+    let mut emitted = HashSet::new();
+    let mut recents: Vec<_> = recent_projects.entries.iter().collect();
+    recents.sort_by(|(a_path, a_time), (b_path, b_time)| {
+        b_time
+            .cmp(a_time)
+            .then_with(|| Path::new(a_path).cmp(Path::new(b_path)))
+    });
 
+    for (path, _) in recents {
+        if cancelled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let path = Path::new(path);
+        let Some(project) = recent_project(root, path, cancelled) else {
+            continue;
+        };
+        if emitted.insert(project.path.clone()) && !emit(project) {
+            return false;
+        }
+    }
+
+    let mut active_symlink_targets = fs::canonicalize(root).ok().into_iter().collect();
+    visit_dirs_streaming(
+        root,
+        cancelled,
+        &mut emitted,
+        &mut active_symlink_targets,
+        &mut emit,
+    )
+}
+
+// Validates a persisted path with the same marker and boundary rules as scanning.
+fn recent_project(root: &Path, path: &Path, cancelled: &AtomicBool) -> Option<Project> {
+    if path.components().any(|component| matches!(component, std::path::Component::ParentDir)) {
+        return None;
+    }
+    let root_scan = inspect_directory(root, false, cancelled)?;
+    if path != root && root_scan.is_workspace {
+        return None;
+    }
+    if path == root {
+        return root_scan.project;
+    }
+    let relative = path.strip_prefix(root).ok()?;
+    let mut ancestor = root.to_path_buf();
+    let components: Vec<_> = relative.components().collect();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        let std::path::Component::Normal(name) = component else {
+            return None;
+        };
+        let name = name.to_str()?;
+        if name == ".git" || should_skip_project_scan_dir(name) {
+            return None;
+        }
+        ancestor.push(name);
+        if inspect_directory(&ancestor, false, cancelled)?.is_workspace {
+            return None;
+        }
+    }
+    inspect_directory(path, false, cancelled)?.project
+}
+
+struct DirectoryScan {
+    project: Option<Project>,
+    is_workspace: bool,
+    children: Vec<(PathBuf, bool)>,
+}
+
+// Inspects direct entries once so recent probing and tree walking agree.
+fn inspect_directory(
+    dir: &Path,
+    collect_children: bool,
+    cancelled: &AtomicBool,
+) -> Option<DirectoryScan> {
+    let entries = fs::read_dir(dir).ok()?;
     let mut has_git_dir = false;
     let mut has_cargo_toml = false;
-    let mut child_dirs = Vec::new();
+    let mut children = Vec::new();
 
     for entry in entries.flatten() {
+        if cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name();
         let path = entry.path();
-        if path.is_dir() {
-            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                if name == ".git" {
-                    has_git_dir = true;
-                    continue;
-                }
-
-                if should_skip_project_scan_dir(name) {
-                    continue;
-                }
+        let is_dir = file_type.is_dir() || (file_type.is_symlink() && path.is_dir());
+        if is_dir {
+            if name == ".git" {
+                has_git_dir = true;
+            } else if !name
+                .to_str()
+                .is_some_and(should_skip_project_scan_dir)
+                && collect_children
+            {
+                children.push((path, file_type.is_symlink()));
             }
-
-            child_dirs.push(path);
             continue;
         }
-
-        if path.file_name().is_some_and(|name| name == "Cargo.toml") {
+        if name == "Cargo.toml" {
             has_cargo_toml = true;
         }
     }
 
     let is_workspace = has_cargo_toml && is_workspace_root(dir);
-
-    if (has_git_dir || has_cargo_toml) && seen.insert(dir.to_path_buf()) {
-        if let Some(name) = dir.file_name().and_then(|name| name.to_str()) {
-            projects.push(Project {
-                name: name.to_string(),
+    let project = (has_git_dir || has_cargo_toml)
+        .then(|| {
+            dir.file_name().and_then(|name| name.to_str()).map(|name| Project {
+                name: name.to_owned(),
                 path: dir.to_path_buf(),
                 has_git_dir,
                 is_workspace,
-            });
-        }
-    }
+            })
+        })
+        .flatten();
 
-    if is_workspace {
-        return;
-    }
-
-    for child in child_dirs {
-        visit_dirs(&child, projects, seen);
-    }
+    Some(DirectoryScan {
+        project,
+        is_workspace,
+        children,
+    })
 }
 
+// Workspace roots are project rows but terminate recursive discovery.
 fn is_workspace_root(dir: &Path) -> bool {
     fs::read_to_string(dir.join("Cargo.toml"))
-        .ok()
-        .is_some_and(|cargo_toml| cargo_toml.contains("[workspace]"))
+        .is_ok_and(|contents| contents.contains("[workspace]"))
+}
+
+// Keeps lexical aliases visible while preventing a symlink from recursing into an ancestor.
+fn visit_dirs_streaming(
+    dir: &Path,
+    cancelled: &AtomicBool,
+    emitted: &mut HashSet<PathBuf>,
+    active_symlink_targets: &mut HashSet<PathBuf>,
+    emit: &mut impl FnMut(Project) -> bool,
+) -> bool {
+    if cancelled.load(Ordering::Relaxed) {
+        return false;
+    }
+    let Some(scan) = inspect_directory(dir, true, cancelled) else {
+        return !cancelled.load(Ordering::Relaxed);
+    };
+    if let Some(project) = scan.project {
+        if emitted.insert(project.path.clone()) && !emit(project) {
+            return false;
+        }
+    }
+    if scan.is_workspace {
+        return true;
+    }
+
+    for (child, is_symlink) in scan.children {
+        if cancelled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let canonical = if is_symlink {
+            let Ok(canonical) = fs::canonicalize(&child) else {
+                continue;
+            };
+            if !active_symlink_targets.insert(canonical.clone()) {
+                continue;
+            }
+            Some(canonical)
+        } else {
+            None
+        };
+        let keep_scanning = visit_dirs_streaming(
+            &child,
+            cancelled,
+            emitted,
+            active_symlink_targets,
+            emit,
+        );
+        if let Some(canonical) = canonical {
+            active_symlink_targets.remove(&canonical);
+        }
+        if !keep_scanning {
+            return false;
+        }
+    }
+    true
 }
 
 fn should_skip_project_scan_dir(name: &str) -> bool {

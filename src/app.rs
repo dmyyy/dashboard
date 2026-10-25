@@ -9,9 +9,7 @@ use persistence::{
     save_bookmarked_projects, save_recent_projects,
 };
 use portable_pty::{CommandBuilder as PtyCommandBuilder, PtySize, native_pty_system};
-use projects::{
-    Project, directory_size, discover_projects, format_timestamp, projects_root, sort_projects,
-};
+use projects::{Project, projects_root};
 use providers::{
     CiRunsData, LanguageStat, LanguagesData, ProjectMetadataSummary, discover_ci_runs,
     discover_languages, discover_project_metadata, git_status,
@@ -29,7 +27,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicBool},
     thread,
     time::Instant,
 };
@@ -111,9 +109,14 @@ pub struct App {
     pub projects: Vec<Project>,
     pub recent_projects: RecentProjects,
     pub bookmarked_projects: BookmarkedProjects,
+    pub discovering_projects: bool,
+    pub discovery_generation: u64,
+    pub discovery_cancel: Option<Arc<AtomicBool>>,
+    pub discovery_seen: HashSet<PathBuf>,
     pub background_tx: mpsc::UnboundedSender<BackgroundResult>,
     pub background_rx: mpsc::UnboundedReceiver<BackgroundResult>,
     pub background_limiter: Arc<Semaphore>,
+    pub size_limiter: Arc<Semaphore>,
     pub events: EventHandler,
 }
 
@@ -122,13 +125,9 @@ impl Default for App {
         let projects_root = projects_root();
         let recent_projects = load_recent_projects();
         let bookmarked_projects = load_bookmarked_projects();
-        let mut projects = discover_projects(&projects_root);
-        sort_projects(&mut projects, &recent_projects);
         let (background_tx, background_rx) = mpsc::unbounded_channel();
 
-        let background_limiter = Arc::new(Semaphore::new(8));
-
-        let mut app = Self {
+        Self {
             running: true,
             confirm_delete_project: false,
             show_help: false,
@@ -174,24 +173,19 @@ impl Default for App {
             git_status_scan_index: 0,
             pending_g: false,
             projects_root,
-            projects,
+            projects: Vec::new(),
             recent_projects,
             bookmarked_projects,
+            discovering_projects: false,
+            discovery_generation: 0,
+            discovery_cancel: None,
+            discovery_seen: HashSet::new(),
             background_tx,
             background_rx,
-            background_limiter,
+            background_limiter: Arc::new(Semaphore::new(8)),
+            size_limiter: Arc::new(Semaphore::new(1)),
             events: EventHandler::new(),
-        };
-
-        app.rebuild_project_matcher();
-        if !app.filtered_projects.is_empty() {
-            app.cursor = 0;
-            app.refresh_targets();
         }
-
-        app.request_all_project_sizes();
-
-        app
     }
 }
 
@@ -201,6 +195,7 @@ impl App {
     }
 
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
+        self.reload_projects();
         while self.running {
             terminal.draw(|frame| ui::render(frame, &mut self))?;
             match self.events.next().await? {
@@ -237,9 +232,14 @@ impl App {
             };
         }
 
+        let selected_path = self.current_project().map(|project| project.path.clone());
+        let projects_changed = self.drain_background_results();
         let project_status = self.project_matcher.tick(0);
-        if project_status.changed {
+        if projects_changed || project_status.changed {
             self.sync_filtered_projects();
+        }
+        if selected_path != self.current_project().map(|project| project.path.clone()) {
+            self.refresh_targets();
         }
 
         let target_status = self.target_matcher.tick(0);
@@ -247,16 +247,20 @@ impl App {
             self.sync_filtered_targets();
         }
 
-        self.drain_background_results();
-        self.request_visible_project_data();
-        self.request_visible_git_statuses();
-        self.request_next_git_status_batch(4);
         self.request_current_project_metadata();
         self.request_current_project_ci_runs();
         self.request_current_project_languages();
+        self.request_visible_project_data();
+        self.request_visible_git_statuses();
+        if !self.discovering_projects {
+            self.request_next_git_status_batch(4);
+        }
     }
 
     pub fn quit(&mut self) {
+        if let Some(cancel) = &self.discovery_cancel {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         self.running = false;
     }
 
@@ -277,12 +281,14 @@ impl App {
 
 #[cfg(test)]
 mod project_tests {
-    use super::{RecentProjects, discover_projects, sort_projects};
+    use super::{BackgroundResult, RecentProjects};
+    use super::projects::{Project, discover_projects, discover_projects_streaming, sort_projects};
+    use super::test_support::empty_app;
     use std::{
         collections::HashMap,
         fs,
         path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::atomic::{AtomicBool, AtomicU64, Ordering},
     };
 
     static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -367,6 +373,145 @@ mod project_tests {
                 .collect::<Vec<_>>(),
             ["newer", "older", "git-a", "plain-a", "plain-b"]
         );
+    }
+
+    #[test]
+    fn streams_recent_projects_before_tree_scan() {
+        let root = TempDir::new();
+        for name in ["older", "newer", "undiscovered"] {
+            fs::create_dir(root.0.join(name)).expect("project directory");
+            fs::write(root.0.join(name).join("Cargo.toml"), "[package]")
+                .expect("project manifest");
+        }
+        let recents = RecentProjects {
+            entries: HashMap::from([
+                (root.0.join("older").to_string_lossy().into_owned(), 10),
+                (root.0.join("newer").to_string_lossy().into_owned(), 20),
+            ]),
+        };
+        let cancelled = AtomicBool::new(false);
+        let mut streamed = Vec::new();
+
+        assert!(discover_projects_streaming(
+            &root.0,
+            &recents,
+            &cancelled,
+            |project| {
+                streamed.push(project.name);
+                true
+            },
+        ));
+        assert_eq!(&streamed[..2], ["newer", "older"]);
+        assert!(streamed.contains(&"undiscovered".to_string()));
+    }
+
+    #[test]
+    fn streams_discovery_batches_without_waiting_for_completion() {
+        let mut app = empty_app();
+        app.discovery_generation = 7;
+        app.discovering_projects = true;
+        let newer = PathBuf::from("/projects/newer");
+        let older = PathBuf::from("/projects/older");
+        app.recent_projects.entries = HashMap::from([
+            (newer.to_string_lossy().into_owned(), 20),
+            (older.to_string_lossy().into_owned(), 10),
+        ]);
+        app.background_tx
+            .send(BackgroundResult::ProjectsDiscovered {
+                generation: 7,
+                projects: vec![
+                    Project {
+                        name: "older".to_string(),
+                        path: older,
+                        has_git_dir: false,
+                        is_workspace: false,
+                    },
+                    Project {
+                        name: "newer".to_string(),
+                        path: newer,
+                        has_git_dir: false,
+                        is_workspace: false,
+                    },
+                ],
+            })
+            .expect("discovery result");
+
+        assert!(app.drain_background_results());
+        app.sync_filtered_projects();
+        assert_eq!(
+            app.visible_projects()
+                .map(|project| project.name.as_str())
+                .collect::<Vec<_>>(),
+            ["newer", "older"]
+        );
+        assert!(app.discovering_projects);
+    }
+
+    #[test]
+    fn keeps_selected_project_when_streaming_reorders_rows() {
+        let mut app = empty_app();
+        app.discovery_generation = 1;
+        let older = PathBuf::from("/projects/older");
+        let newer = PathBuf::from("/projects/newer");
+        app.projects = vec![
+            Project {
+                name: "older".to_string(),
+                path: older.clone(),
+                has_git_dir: false,
+                is_workspace: false,
+            },
+            Project {
+                name: "newer".to_string(),
+                path: newer.clone(),
+                has_git_dir: false,
+                is_workspace: false,
+            },
+        ];
+        app.recent_projects.entries = HashMap::from([
+            (older.to_string_lossy().into_owned(), 10),
+            (newer.to_string_lossy().into_owned(), 20),
+        ]);
+        app.sync_filtered_projects();
+        app.cursor = 1;
+        let latest = PathBuf::from("/projects/latest");
+        app.recent_projects
+            .entries
+            .insert(latest.to_string_lossy().into_owned(), 30);
+        app.background_tx
+            .send(BackgroundResult::ProjectsDiscovered {
+                generation: 1,
+                projects: vec![Project {
+                    name: "latest".to_string(),
+                    path: latest,
+                    has_git_dir: false,
+                    is_workspace: false,
+                }],
+            })
+            .expect("discovery result");
+
+        assert!(app.drain_background_results());
+        app.sync_filtered_projects();
+        assert_eq!(app.current_project().map(|project| &project.path), Some(&older));
+    }
+
+    #[test]
+    fn ignores_stale_discovery_batches() {
+        let mut app = empty_app();
+        app.discovery_generation = 2;
+        app.background_tx
+            .send(BackgroundResult::ProjectsDiscovered {
+                generation: 1,
+                projects: vec![Project {
+                    name: "stale".to_string(),
+                    path: PathBuf::from("/projects/stale"),
+                    has_git_dir: false,
+                    is_workspace: false,
+                }],
+            })
+            .expect("stale result");
+
+        assert!(!app.drain_background_results());
+        assert!(app.projects.is_empty());
     }
 }
 
