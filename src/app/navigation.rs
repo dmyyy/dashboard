@@ -1,4 +1,4 @@
-use super::{App, Focus};
+use super::{App, Focus, projects::Project};
 use nucleo::{
     Config, Nucleo, Utf32String,
     pattern::{CaseMatching, Normalization},
@@ -356,17 +356,21 @@ impl App {
     }
     pub(super) fn rebuild_project_matcher(&mut self) {
         self.project_matcher.restart(true);
-        let injector = self.project_matcher.injector();
         for project in self.projects.clone() {
-            injector.push(project, |project, cols| {
-                cols[0] = Utf32String::from(
-                    format!("{} {}", project.name, project.path.display()).as_str(),
-                );
-                cols[1] = Utf32String::from(project.name.as_str());
-                cols[2] = Utf32String::from(project.path.to_string_lossy().as_ref());
-            });
+            self.inject_project(project);
         }
         self.update_project_filter();
+    }
+
+    // Adds streamed projects without resetting pending fuzzy work.
+    pub(super) fn inject_project(&self, project: Project) {
+        self.project_matcher.injector().push(project, |project, cols| {
+            cols[0] = Utf32String::from(
+                format!("{} {}", project.name, project.path.display()).as_str(),
+            );
+            cols[1] = Utf32String::from(project.name.as_str());
+            cols[2] = Utf32String::from(project.path.to_string_lossy().as_ref());
+        });
     }
 
     pub(super) fn rebuild_target_matcher(&mut self) {
@@ -449,27 +453,50 @@ impl App {
     }
 
     pub(super) fn sync_filtered_projects(&mut self) {
-        self.filtered_projects = self
-            .project_matcher
-            .snapshot()
-            .matched_items(..)
-            .map(|item| item.data.clone())
-            .filter_map(|project| {
-                self.projects
-                    .iter()
-                    .position(|candidate| candidate.path == project.path)
-            })
-            .collect();
+        let selected_path = self.current_project().map(|project| project.path.clone());
+        if self.project_query.is_empty() {
+            self.filtered_projects = (0..self.projects.len()).collect();
+            self.filtered_projects.sort_by(|&a, &b| {
+                super::projects::compare_projects(
+                    &self.projects[a],
+                    &self.projects[b],
+                    &self.recent_projects,
+                )
+            });
+        } else {
+            self.filtered_projects = self
+                .project_matcher
+                .snapshot()
+                .matched_items(..)
+                .map(|item| item.data.clone())
+                .filter_map(|project| {
+                    self.projects
+                        .iter()
+                        .position(|candidate| candidate.path == project.path)
+                })
+                .collect();
+        }
 
+        if let Some(selected_path) = selected_path {
+            self.cursor = self
+                .filtered_projects
+                .iter()
+                .position(|&project_index| {
+                    self.projects
+                        .get(project_index)
+                        .is_some_and(|project| project.path == selected_path)
+                })
+                .map_or(-1, |index| index as isize);
+        } else {
+            self.cursor = if self.filtered_projects.is_empty() { -1 } else { 0 };
+        }
+        if self.cursor < 0 && !self.filtered_projects.is_empty() {
+            self.cursor = 0;
+        }
         if self.filtered_projects.is_empty() {
-            self.cursor = -1;
             self.targets.clear();
             self.filtered_targets.clear();
             self.target_cursor = -1;
-        } else {
-            self.cursor = self
-                .cursor
-                .clamp(0, self.filtered_projects.len() as isize - 1);
         }
     }
 
