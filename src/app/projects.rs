@@ -654,22 +654,18 @@ impl App {
             return Ok(());
         };
 
-        // add test comment
-
         let project_path = project.path.clone();
         let project_name = shell_escape_arg(&project.name);
-        // Create the tab directly so Zellij starts its initial terminal normally.
-        let command = if no_focus {
-            format!(
-                "zellij action new-tab -n {project_name} --cwd {cwd} --no-focus",
-                cwd = shell_escape_path(&project_path)
-            )
-        } else {
-            format!(
-                "zellij action new-tab -n {project_name} --cwd {cwd}",
-                cwd = shell_escape_path(&project_path)
-            )
-        };
+        let cwd = shell_escape_path(&project_path);
+        let pane_focus = if no_focus { " --no-focus" } else { "" };
+        // Start a fresh OMP session in a floating pane while preserving an interactive shell in the tab.
+        let tab_command =
+            format!("zellij action new-pane --floating{pane_focus} --cwd {cwd} -- omp; exec fish");
+        let tab_options = if no_focus { " --no-focus" } else { "" };
+        let command = format!(
+            "zellij action new-tab -n {project_name} --cwd {cwd}{tab_options} -- sh -c {}",
+            shell_escape_arg(&tab_command)
+        );
 
         Command::new("sh")
             .arg("-c")

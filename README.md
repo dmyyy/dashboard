@@ -51,8 +51,8 @@ Follow the interactive prompts to sign in to GitHub.com. Then start dashboard wi
 
 ### Projects
 
-- `Enter` — open project in a new Zellij tab
-- `O` — open project in a new Zellij tab without switching to it
+- `Enter` — open project in a new Zellij tab with OMP in a floating pane
+- `O` — open project without switching to it; OMP starts without taking focus
 - `a` — add project (`cargo new`) or clone from git URL
 - `b` — toggle bookmark
 - `d` — delete project (with confirmation)
