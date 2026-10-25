@@ -21,7 +21,7 @@ pub(super) fn render_delete_dialog(frame: &mut Frame, app: &App) {
                     .title_alignment(Alignment::Center)
                     .border_type(BorderType::Rounded),
             )
-            .style(Style::default().fg(Color::Red).bg(Color::Black)),
+            .style(Style::default().fg(Color::White).bg(Color::Black)),
         area,
     );
 }
@@ -42,7 +42,7 @@ pub(super) fn render_create_project_dialog(frame: &mut Frame, app: &App) {
                     .title_alignment(Alignment::Center)
                     .border_type(BorderType::Rounded),
             )
-            .style(Style::default().fg(Color::Green).bg(Color::Black)),
+            .style(Style::default().fg(Color::White).bg(Color::Black)),
         area,
     );
 
@@ -51,7 +51,7 @@ pub(super) fn render_create_project_dialog(frame: &mut Frame, app: &App) {
 }
 
 pub(super) fn render_create_project_pending_dialog(frame: &mut Frame) {
-    let area = centered_rect(frame.area(), 40, 5);
+    let area = centered_rect(frame.area(), 40, 3);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new("Creating project…")
@@ -62,7 +62,7 @@ pub(super) fn render_create_project_pending_dialog(frame: &mut Frame) {
                     .title_alignment(Alignment::Center)
                     .border_type(BorderType::Rounded),
             )
-            .style(Style::default().fg(Color::Yellow).bg(Color::Black)),
+            .style(Style::default().fg(Color::White).bg(Color::Black)),
         area,
     );
 }
@@ -81,6 +81,7 @@ Actions\n\
   /                Search projects or targets\n\
   %n/%p query      Search name/path; targets also support %k kind\n\
   Enter            Open project / run target / open CI run\n\
+  O                Open project without switching to its tab\n\
   a, b, c, d       Add, bookmark, clean, delete project\n\
   e                Edit selected target\n\
   q                Close selected running target\n\

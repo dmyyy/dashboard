@@ -56,9 +56,9 @@ pub(super) fn pane_border_style(focused: bool) -> Style {
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let columns = Layout::horizontal([
-        Constraint::Percentage(30),
-        Constraint::Percentage(35),
-        Constraint::Percentage(35),
+        Constraint::Percentage(33),
+        Constraint::Percentage(34),
+        Constraint::Percentage(33),
     ])
     .spacing(1);
 

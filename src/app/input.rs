@@ -212,11 +212,14 @@ impl App {
                 Focus::Targets => self.select_previous_target(),
             },
             KeyCode::Enter => match self.focus {
-                Focus::Projects => self.open_selected_project()?,
+                Focus::Projects => self.open_selected_project(false)?,
                 Focus::RunningTargets => self.rerun_selected_running_target()?,
                 Focus::CiRuns => self.open_selected_ci_run()?,
                 Focus::Targets => self.run_selected_target()?,
             },
+            KeyCode::Char('O') if self.focus == Focus::Projects => {
+                self.open_selected_project(true)?
+            }
             KeyCode::Char('e') if self.focus == Focus::Targets => self.edit_selected_target()?,
             _ => {}
         }

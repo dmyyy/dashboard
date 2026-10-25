@@ -19,17 +19,13 @@ Terminal dashboard for browsing local Rust projects, opening them in Zellij, and
 
 Install Rust/Cargo, [Fish](https://fishshell.com/), [Zellij](https://zellij.dev/), [Helix](https://helix-editor.com/), and the [GitHub CLI](https://cli.github.com/). Install [`tokei`](https://github.com/XAMPPRocky/tokei) to show language statistics.
 
-### Install dashboard and its Fish helper
+### Install dashboard
 
 ```fish
 git clone https://github.com/dmyyy/cargo-dashboard.git
 cd cargo-dashboard
 cargo install --path . --locked
-mkdir -p ~/.config/fish/functions
-cp fish/functions/*.fish ~/.config/fish/functions/
 ```
-
-The copied `zj_open_project` function is required when opening a project from dashboard. Restart Fish or run `source ~/.config/fish/functions/zj_open_project.fish` after copying it.
 
 ### Authenticate GitHub CLI
 
@@ -56,6 +52,7 @@ Follow the interactive prompts to sign in to GitHub.com. Then start dashboard wi
 ### Projects
 
 - `Enter` — open project in a new Zellij tab
+- `O` — open project in a new Zellij tab without switching to it
 - `a` — add project (`cargo new`) or clone from git URL
 - `b` — toggle bookmark
 - `d` — delete project (with confirmation)

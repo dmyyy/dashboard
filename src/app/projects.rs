@@ -1,5 +1,5 @@
 use super::persistence::{RecentProjects, save_bookmarked_projects, save_recent_projects};
-use super::{App, BackgroundResult, Focus, Target, shell_escape_path};
+use super::{App, BackgroundResult, Focus, Target, shell_escape_arg, shell_escape_path};
 use std::{
     collections::HashSet,
     env, fs,
@@ -469,16 +469,27 @@ impl App {
     pub fn cached_project_size_bytes(&self, project: &Project) -> Option<u64> {
         self.size_cache.get(&project.path).copied()
     }
-    pub fn open_selected_project(&mut self) -> color_eyre::Result<()> {
+    pub fn open_selected_project(&mut self, no_focus: bool) -> color_eyre::Result<()> {
         let Some(project) = self.current_project() else {
             return Ok(());
         };
 
+        // add test comment
+
         let project_path = project.path.clone();
-        let command = format!(
-            "zellij action new-tab && (cd {cwd} && env YAZI=false fish -c zj_open_project) >/dev/null 2>&1 & zellij action go-to-previous-tab >/dev/null 2>&1",
-            cwd = shell_escape_path(&project_path)
-        );
+        let project_name = shell_escape_arg(&project.name);
+        // Create the tab directly so Zellij starts its initial terminal normally.
+        let command = if no_focus {
+            format!(
+                "zellij action new-tab -n {project_name} --cwd {cwd} --no-focus",
+                cwd = shell_escape_path(&project_path)
+            )
+        } else {
+            format!(
+                "zellij action new-tab -n {project_name} --cwd {cwd}",
+                cwd = shell_escape_path(&project_path)
+            )
+        };
 
         Command::new("sh")
             .arg("-c")
