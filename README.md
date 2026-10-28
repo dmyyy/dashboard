@@ -12,7 +12,6 @@ Terminal dashboard for browsing local Rust projects, opening them in Zellij, and
 - Discovers Cargo **bin**, **example**, **test**, and **bench** targets
 - Lets you **open** a project, **run** a target in a Zellij pane, or **explore/edit** the target source
 
-
 ## Installation
 
 ### Prerequisites
@@ -53,6 +52,7 @@ Follow the interactive prompts to sign in to GitHub.com. Then start dashboard wi
 
 - `Enter` — open project in a new Zellij tab with OMP in a floating pane
 - `O` — open project without switching to it; OMP starts without taking focus
+- `+` — open the project in tab designed for agentic usage
 - `a` — add project (`cargo new`) or clone from git URL
 - `b` — toggle bookmark
 - `d` — delete project (with confirmation)

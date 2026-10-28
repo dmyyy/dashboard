@@ -220,6 +220,7 @@ impl App {
             KeyCode::Char('O') if self.focus == Focus::Projects => {
                 self.open_selected_project(true)?
             }
+            KeyCode::Char('+') if self.focus == Focus::Projects => self.open_selected_vibe_tab()?,
             KeyCode::Char('e') if self.focus == Focus::Targets => self.edit_selected_target()?,
             _ => {}
         }

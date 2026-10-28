@@ -82,6 +82,7 @@ Actions\n\
   %n/%p query      Search name/path; targets also support %k kind\n\
   Enter            Open project / run target / open CI run\n\
   O                Open project without switching to its tab\n\
+  +                Open project in a Vibe tab\n\
   a, b, c, d       Add, bookmark, clean, delete project\n\
   e                Edit selected target\n\
   q                Close selected running target\n\

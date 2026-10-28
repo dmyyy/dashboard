@@ -679,6 +679,28 @@ impl App {
         self.mark_project_opened(&project_path);
         Ok(())
     }
+
+    pub fn open_selected_vibe_tab(&self) -> color_eyre::Result<()> {
+        let Some(project) = self.current_project() else {
+            return Ok(());
+        };
+
+        let cwd = shell_escape_path(&project.path);
+        let tab_name = shell_escape_arg(&format!("-{}", project.name));
+        // Start the Vibe layout in a tab rooted at the selected project.
+        let command = format!(
+            "zellij action new-tab --layout ~/.config/zellij/layouts/vibe.kdl --cwd {cwd} --name {tab_name}"
+        );
+
+        Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        Ok(())
+    }
     pub fn current_project(&self) -> Option<&Project> {
         let visible_index = usize::try_from(self.cursor).ok()?;
         let project_index = *self.filtered_projects.get(visible_index)?;
