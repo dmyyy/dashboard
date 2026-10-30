@@ -375,7 +375,7 @@ impl App {
         };
 
         let project_path = project.path.clone();
-        fs::remove_dir_all(&project_path)?;
+        remove_project_directory(project)?;
 
         let key = project_path.to_string_lossy().to_string();
         self.bookmarked_projects.entries.remove(&key);
@@ -1059,6 +1059,52 @@ impl App {
     }
 }
 
+// Removes linked worktrees through Git so its metadata and branch state stay consistent.
+fn remove_project_directory(project: &Project) -> color_eyre::Result<()> {
+    let Some(parent) = project.worktree_parent() else {
+        fs::remove_dir_all(&project.path)?;
+        return Ok(());
+    };
+
+    let branch = Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(&project.path)
+        .output()?;
+    if !branch.status.success() {
+        return Err(color_eyre::eyre::eyre!(
+            "could not determine worktree branch for {}",
+            project.path.display()
+        ));
+    }
+    let branch = String::from_utf8_lossy(&branch.stdout).trim().to_owned();
+
+    let removal = Command::new("git")
+        .args(["worktree", "remove", "--force"])
+        .arg(&project.path)
+        .current_dir(parent)
+        .status()?;
+    if !removal.success() {
+        return Err(color_eyre::eyre::eyre!(
+            "could not remove Git worktree {}",
+            project.path.display()
+        ));
+    }
+
+    if !branch.is_empty() {
+        let deletion = Command::new("git")
+            .args(["branch", "--delete", "--force", &branch])
+            .current_dir(parent)
+            .status()?;
+        if !deletion.success() {
+            return Err(color_eyre::eyre::eyre!(
+                "could not delete worktree branch {branch}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 // Prefixes tabs opened from a linked worktree without changing the project display name.
 fn project_tab_name(project: &Project, suffix: &str) -> String {
     let marker = if project.is_worktree() { "󰙨 " } else { "" };
@@ -1121,12 +1167,13 @@ fn linear_to_srgb(component: f64) -> f64 {
 mod tests {
     use super::{
         Project, clashes_with_magenta, format_timestamp, project_tab_name, random_accent_color,
-        rename_cargo_project, sort_projects, unix_timestamp_now,
+        remove_project_directory, rename_cargo_project, sort_projects, unix_timestamp_now,
     };
     use crate::app::{RecentProjects, test_support::empty_app};
     use std::{
         fs,
         path::{Path, PathBuf},
+        process::Command,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1225,6 +1272,71 @@ mod tests {
         assert!(projects[1].is_worktree());
         assert_eq!(project_tab_name(&projects[1], ""), "󰙨 feature");
         assert_eq!(project_tab_name(&projects[0], "☆"), "dashboard☆");
+    }
+
+    #[test]
+    fn removes_git_worktree_and_its_branch() {
+        let root = std::env::temp_dir().join(format!(
+            "dashboard-worktree-delete-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let parent = root.join("project");
+        let worktree = parent.join(".worktrees/feature");
+        fs::create_dir_all(&parent).unwrap();
+        Command::new("git").args(["init"]).current_dir(&parent).status().unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&parent)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(&parent)
+            .status()
+            .unwrap();
+        fs::write(parent.join("README.md"), "fixture").unwrap();
+        Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(&parent)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(&parent)
+            .status()
+            .unwrap();
+        fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        Command::new("git")
+            .args(["worktree", "add", "-b", "feature", worktree.to_str().unwrap()])
+            .current_dir(&parent)
+            .status()
+            .unwrap();
+
+        remove_project_directory(&Project {
+            name: "feature".to_owned(),
+            path: worktree.clone(),
+            has_git_dir: true,
+            is_workspace: false,
+        })
+        .unwrap();
+
+        assert!(!worktree.exists());
+        let branches = Command::new("git")
+            .args(["branch", "--list", "feature"])
+            .current_dir(&parent)
+            .output()
+            .unwrap();
+        assert!(branches.stdout.is_empty());
+        let worktrees = Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&parent)
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&worktrees.stdout).contains(worktree.to_str().unwrap()));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
