@@ -686,7 +686,7 @@ impl App {
         };
 
         let cwd = shell_escape_path(&project.path);
-        let tab_name = shell_escape_arg(&format!("-{}", project.name));
+        let tab_name = shell_escape_arg(&format!("{}☆", project.name));
         // Start the Vibe layout in a tab rooted at the selected project.
         let command = format!(
             "zellij action new-tab --layout ~/.config/zellij/layouts/vibe.kdl --cwd {cwd} --name {tab_name}"
