@@ -1,5 +1,6 @@
 use super::persistence::{RecentProjects, save_bookmarked_projects, save_recent_projects};
 use super::{App, BackgroundResult, Focus, Target, shell_escape_arg, shell_escape_path};
+use rand::Rng;
 use std::{
     collections::HashSet,
     env, fs,
@@ -10,6 +11,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
+use toml_edit::{DocumentMut, value};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Project {
@@ -89,6 +91,104 @@ impl App {
         Ok(())
     }
 
+    pub(super) fn start_rename_project(&mut self) {
+        let Some(name) = self.current_project().and_then(|project| {
+            project
+                .path
+                .join("Cargo.toml")
+                .is_file()
+                .then(|| project.name.clone())
+        }) else {
+            return;
+        };
+
+        self.renaming_project = true;
+        self.rename_project_input = name.into();
+    }
+
+    pub(super) fn cancel_rename_project(&mut self) {
+        self.renaming_project = false;
+        self.rename_project_input.reset();
+    }
+
+    pub(super) fn confirm_rename_project(&mut self) -> color_eyre::Result<()> {
+        let name = self.rename_project_input.value().trim().to_owned();
+        if name.is_empty() {
+            self.cancel_rename_project();
+            return Ok(());
+        }
+        if Path::new(&name).components().count() != 1 {
+            return Ok(());
+        }
+
+        let Some(project) = self.current_project() else {
+            self.cancel_rename_project();
+            return Ok(());
+        };
+        let old_path = project.path.clone();
+        let new_path = old_path.with_file_name(&name);
+        if new_path == old_path {
+            self.cancel_rename_project();
+            return Ok(());
+        }
+        if new_path.exists() {
+            return Ok(());
+        }
+
+        rename_cargo_project(&old_path, &new_path, &name)?;
+        self.replace_project_path(&old_path, &new_path, &name);
+        self.cancel_rename_project();
+        self.reload_projects();
+        Ok(())
+    }
+
+    // Updates in-memory and persisted path keys after a project directory moves.
+    fn replace_project_path(&mut self, old_path: &Path, new_path: &Path, name: &str) {
+        let old_key = old_path.to_string_lossy().into_owned();
+        let new_key = new_path.to_string_lossy().into_owned();
+        if let Some(timestamp) = self.recent_projects.entries.remove(&old_key) {
+            self.recent_projects
+                .entries
+                .insert(new_key.clone(), timestamp);
+        }
+        if self.bookmarked_projects.entries.remove(&old_key) {
+            self.bookmarked_projects.entries.insert(new_key.clone());
+        }
+        if let Some(color) = self.project_colors.remove(&old_key) {
+            self.project_colors.insert(new_key, color);
+        }
+        let _ = save_recent_projects(&self.recent_projects);
+        let _ = save_bookmarked_projects(&self.bookmarked_projects);
+
+        if let Some(project) = self
+            .projects
+            .iter_mut()
+            .find(|project| project.path == old_path)
+        {
+            project.name = name.to_owned();
+            project.path = new_path.to_path_buf();
+        }
+        self.metadata_cache.remove(old_path);
+        self.ci_runs_cache.remove(old_path);
+        self.languages_cache.remove(old_path);
+        self.git_status_cache.remove(old_path);
+        self.size_cache.remove(old_path);
+        self.target_cache.remove(old_path);
+        self.loading_metadata.remove(old_path);
+        self.loading_ci_runs.remove(old_path);
+        self.loading_languages.remove(old_path);
+        self.loading_git_statuses.remove(old_path);
+        self.loading_sizes.remove(old_path);
+        self.loading_targets.remove(old_path);
+        for status in &mut self.target_statuses {
+            if status.project_path == old_path {
+                status.project_path = new_path.to_path_buf();
+            }
+        }
+        self.rebuild_project_matcher();
+        self.refresh_targets();
+    }
+
     pub(super) fn reload_projects(&mut self) {
         if let Some(cancel) = &self.discovery_cancel {
             cancel.store(true, Ordering::Relaxed);
@@ -109,11 +209,8 @@ impl App {
             let result = tokio::task::spawn_blocking(move || {
                 let mut batch = Vec::new();
                 let mut emitted = 0usize;
-                let completed = discover_projects_streaming(
-                    &root,
-                    &recent_projects,
-                    &cancelled,
-                    |project| {
+                let completed =
+                    discover_projects_streaming(&root, &recent_projects, &cancelled, |project| {
                         batch.push(project);
                         emitted += 1;
                         if emitted == 1 || batch.len() >= 16 {
@@ -125,8 +222,7 @@ impl App {
                         } else {
                             true
                         }
-                    },
-                );
+                    });
                 if completed && !batch.is_empty() {
                     let _ = tx.send(BackgroundResult::ProjectsDiscovered {
                         generation,
@@ -137,7 +233,8 @@ impl App {
             })
             .await;
             if matches!(result, Ok(true)) {
-                let _ = completion_tx.send(BackgroundResult::ProjectDiscoveryFinished { generation });
+                let _ =
+                    completion_tx.send(BackgroundResult::ProjectDiscoveryFinished { generation });
             }
         });
     }
@@ -234,6 +331,7 @@ impl App {
         let key = project_path.to_string_lossy().to_string();
         self.bookmarked_projects.entries.remove(&key);
         self.recent_projects.entries.remove(&key);
+        self.project_colors.remove(&key);
         let _ = save_bookmarked_projects(&self.bookmarked_projects);
         let _ = save_recent_projects(&self.recent_projects);
 
@@ -302,6 +400,31 @@ impl App {
         }
     }
 }
+
+// Renames the root Cargo package without reformatting unrelated manifest content.
+fn rename_cargo_manifest(project_path: &Path, name: &str) -> color_eyre::Result<()> {
+    let manifest_path = project_path.join("Cargo.toml");
+    let contents = fs::read_to_string(&manifest_path)?;
+    let mut document = contents
+        .parse::<DocumentMut>()
+        .map_err(|error| color_eyre::eyre::eyre!("invalid Cargo.toml: {error}"))?;
+    let package = document["package"]
+        .as_table_mut()
+        .ok_or_else(|| color_eyre::eyre::eyre!("Cargo.toml has no [package] table"))?;
+    if package.get("name").and_then(|item| item.as_str()).is_none() {
+        return Err(color_eyre::eyre::eyre!("Cargo.toml has no package name"));
+    }
+    package["name"] = value(name);
+    fs::write(manifest_path, document.to_string())?;
+    Ok(())
+}
+
+// Updates the manifest before moving the directory so the project is always Cargo-valid by name.
+fn rename_cargo_project(old_path: &Path, new_path: &Path, name: &str) -> color_eyre::Result<()> {
+    rename_cargo_manifest(old_path, name)?;
+    fs::rename(old_path, new_path)?;
+    Ok(())
+}
 pub(super) fn format_timestamp(timestamp: u64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp as i64, 0)
         .map(|dt| {
@@ -364,15 +487,10 @@ pub(super) fn expand_tilde(path: PathBuf) -> PathBuf {
 pub(super) fn discover_projects(root: &Path) -> Vec<Project> {
     let cancelled = AtomicBool::new(false);
     let mut projects = Vec::new();
-    let _ = discover_projects_streaming(
-        root,
-        &RecentProjects::default(),
-        &cancelled,
-        |project| {
-            projects.push(project);
-            true
-        },
-    );
+    let _ = discover_projects_streaming(root, &RecentProjects::default(), &cancelled, |project| {
+        projects.push(project);
+        true
+    });
     projects
 }
 
@@ -416,7 +534,10 @@ pub(super) fn discover_projects_streaming(
 
 // Validates a persisted path with the same marker and boundary rules as scanning.
 fn recent_project(root: &Path, path: &Path, cancelled: &AtomicBool) -> Option<Project> {
-    if path.components().any(|component| matches!(component, std::path::Component::ParentDir)) {
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
         return None;
     }
     let root_scan = inspect_directory(root, false, cancelled)?;
@@ -475,11 +596,7 @@ fn inspect_directory(
         if is_dir {
             if name == ".git" {
                 has_git_dir = true;
-            } else if !name
-                .to_str()
-                .is_some_and(should_skip_project_scan_dir)
-                && collect_children
-            {
+            } else if !name.to_str().is_some_and(should_skip_project_scan_dir) && collect_children {
                 children.push((path, file_type.is_symlink()));
             }
             continue;
@@ -492,12 +609,14 @@ fn inspect_directory(
     let is_workspace = has_cargo_toml && is_workspace_root(dir);
     let project = (has_git_dir || has_cargo_toml)
         .then(|| {
-            dir.file_name().and_then(|name| name.to_str()).map(|name| Project {
-                name: name.to_owned(),
-                path: dir.to_path_buf(),
-                has_git_dir,
-                is_workspace,
-            })
+            dir.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| Project {
+                    name: name.to_owned(),
+                    path: dir.to_path_buf(),
+                    has_git_dir,
+                    is_workspace,
+                })
         })
         .flatten();
 
@@ -552,13 +671,8 @@ fn visit_dirs_streaming(
         } else {
             None
         };
-        let keep_scanning = visit_dirs_streaming(
-            &child,
-            cancelled,
-            emitted,
-            active_symlink_targets,
-            emit,
-        );
+        let keep_scanning =
+            visit_dirs_streaming(&child, cancelled, emitted, active_symlink_targets, emit);
         if let Some(canonical) = canonical {
             active_symlink_targets.remove(&canonical);
         }
@@ -657,13 +771,14 @@ impl App {
         let project_path = project.path.clone();
         let project_name = shell_escape_arg(&project.name);
         let cwd = shell_escape_path(&project_path);
+        let layout = shell_escape_arg(&self.rendered_layout_string("ide", &project_path)?);
         let pane_focus = if no_focus { " --no-focus" } else { "" };
         // Start a fresh OMP session in a floating pane while preserving an interactive shell in the tab.
         let tab_command =
             format!("zellij action new-pane --floating{pane_focus} --cwd {cwd} -- omp; exec fish");
         let tab_options = if no_focus { " --no-focus" } else { "" };
         let command = format!(
-            "zellij action new-tab -n {project_name} --cwd {cwd}{tab_options} -- sh -c {}",
+            "zellij action new-tab --layout-string {layout} -n {project_name} --cwd {cwd}{tab_options} -- sh -c {}",
             shell_escape_arg(&tab_command)
         );
 
@@ -680,17 +795,18 @@ impl App {
         Ok(())
     }
 
-    pub fn open_selected_vibe_tab(&self) -> color_eyre::Result<()> {
+    pub fn open_selected_vibe_tab(&mut self) -> color_eyre::Result<()> {
         let Some(project) = self.current_project() else {
             return Ok(());
         };
 
-        let cwd = shell_escape_path(&project.path);
+        let project_path = project.path.clone();
+        let cwd = shell_escape_path(&project_path);
         let tab_name = shell_escape_arg(&format!("{}☆", project.name));
+        let layout = shell_escape_arg(&self.rendered_layout_string("vibe", &project_path)?);
         // Start the Vibe layout in a tab rooted at the selected project.
-        let command = format!(
-            "zellij action new-tab --layout ~/.config/zellij/layouts/vibe.kdl --cwd {cwd} --name {tab_name}"
-        );
+        let command =
+            format!("zellij action new-tab --layout-string {layout} --cwd {cwd} --name {tab_name}");
 
         Command::new("sh")
             .arg("-c")
@@ -700,6 +816,32 @@ impl App {
             .stderr(Stdio::null())
             .spawn()?;
         Ok(())
+    }
+
+    // Assigns a distinct session accent by advancing from the previous hue.
+    fn project_color(&mut self, project_path: &Path) -> String {
+        let key = project_path.to_string_lossy().into_owned();
+        if let Some(color) = self.project_colors.get(&key) {
+            return color.clone();
+        }
+
+        let color = random_accent_color(&mut self.project_color_hue);
+        self.project_colors.insert(key, color.clone());
+        color
+    }
+
+    // Renders the selected layout in memory with the project's session accent color.
+    fn rendered_layout_string(
+        &mut self,
+        layout_name: &str,
+        project_path: &Path,
+    ) -> std::io::Result<String> {
+        let color = self.project_color(project_path);
+        let source = expand_tilde(PathBuf::from(format!(
+            "~/.config/zellij/layouts/{layout_name}.kdl"
+        )));
+        // Substitute every existing default accent occurrence in the source layout.
+        fs::read_to_string(source).map(|content| content.replace("#578cff", &color))
     }
     pub fn current_project(&self) -> Option<&Project> {
         let visible_index = usize::try_from(self.cursor).ok()?;
@@ -729,5 +871,142 @@ impl App {
         self.filtered_projects
             .iter()
             .filter_map(|&index| self.projects.get(index))
+    }
+}
+
+// Advances by a broad random offset while avoiding green accents that clash with magenta.
+fn random_accent_color(previous_hue: &mut f64) -> String {
+    let mut rng = rand::rng();
+    loop {
+        let hue = (*previous_hue + rng.random_range(60.0..=240.0)) % 360.0;
+        if !clashes_with_magenta(hue) {
+            if let Some(color) = oklch_to_hex(0.7652, 0.1129, hue) {
+                *previous_hue = hue;
+                return color;
+            }
+        }
+    }
+}
+
+// Green hues around #ff00ff's complementary hue clash with magenta.
+fn clashes_with_magenta(hue: f64) -> bool {
+    (110.0..=190.0).contains(&hue)
+}
+
+fn oklch_to_hex(lightness: f64, chroma: f64, hue_degrees: f64) -> Option<String> {
+    let hue = hue_degrees.to_radians();
+    let a = chroma * hue.cos();
+    let b = chroma * hue.sin();
+    let l = lightness + 0.396_337_777_4 * a + 0.215_803_757_3 * b;
+    let m = lightness - 0.105_561_345_8 * a - 0.063_854_172_8 * b;
+    let s = lightness - 0.089_484_177_5 * a - 1.291_485_548 * b;
+    let (l, m, s) = (l.powi(3), m.powi(3), s.powi(3));
+    let red = 4.076_741_662_1 * l - 3.307_711_591_3 * m + 0.230_969_929_2 * s;
+    let green = -1.268_438_004_6 * l + 2.609_757_401_1 * m - 0.341_319_396_5 * s;
+    let blue = -0.004_196_086_3 * l - 0.703_418_614_7 * m + 1.707_614_701 * s;
+    let srgb = [red, green, blue].map(linear_to_srgb);
+
+    srgb.iter()
+        .all(|component| (0.0..=1.0).contains(component))
+        .then(|| {
+            format!(
+                "#{:02x}{:02x}{:02x}",
+                (srgb[0] * 255.0).round() as u8,
+                (srgb[1] * 255.0).round() as u8,
+                (srgb[2] * 255.0).round() as u8
+            )
+        })
+}
+
+fn linear_to_srgb(component: f64) -> f64 {
+    if component <= 0.003_130_8 {
+        12.92 * component
+    } else {
+        1.055 * component.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clashes_with_magenta, random_accent_color, rename_cargo_project};
+    use crate::app::test_support::empty_app;
+    use std::{
+        fs,
+        path::Path,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    #[test]
+    fn generates_in_gamut_hex_accents_from_the_configured_oklch_color() {
+        let mut hue = 0.0;
+
+        for _ in 0..32 {
+            let color = random_accent_color(&mut hue);
+            assert!(!clashes_with_magenta(hue));
+            assert_eq!(color.len(), 7);
+            assert!(color.starts_with('#'));
+            assert!(color[1..].bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn identifies_green_hues_that_clash_with_magenta() {
+        assert!(!clashes_with_magenta(109.9));
+        assert!(clashes_with_magenta(110.0));
+        assert!(clashes_with_magenta(150.0));
+        assert!(clashes_with_magenta(190.0));
+        assert!(!clashes_with_magenta(190.1));
+    }
+
+    #[test]
+    fn advances_project_hues_by_a_random_broad_offset() {
+        let mut app = empty_app();
+
+        app.project_color(Path::new("/fixture/first"));
+        let first_hue = app.project_color_hue;
+        app.project_color(Path::new("/fixture/second"));
+        let hue_delta = (app.project_color_hue - first_hue).rem_euclid(360.0);
+
+        assert!((60.0..=240.0).contains(&hue_delta));
+    }
+
+    #[test]
+    fn reuses_the_same_accent_for_each_project_path() {
+        let mut app = empty_app();
+        let path = Path::new("/fixture/project");
+        app.project_colors
+            .insert(path.display().to_string(), "#578cff".to_owned());
+        let first = app.project_color(path);
+        let second = app.project_color(path);
+
+        assert_eq!(first, second);
+        assert_eq!(app.project_colors.len(), 1);
+    }
+
+    #[test]
+    fn renames_the_cargo_project_directory_and_preserves_manifest_comments() {
+        let old_path = std::env::temp_dir().join(format!(
+            "dashboard-rename-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let new_path = old_path.with_file_name("dashboard-renamed-project");
+        fs::create_dir_all(&old_path).unwrap();
+        fs::write(
+            old_path.join("Cargo.toml"),
+            "# Keep this comment\n[package]\nname = \"old-name\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        rename_cargo_project(&old_path, &new_path, "new-name").unwrap();
+
+        assert!(!old_path.exists());
+        assert_eq!(
+            fs::read_to_string(new_path.join("Cargo.toml")).unwrap(),
+            "# Keep this comment\n[package]\nname = \"new-name\"\nversion = \"0.1.0\"\n"
+        );
+        fs::remove_dir_all(new_path).unwrap();
     }
 }

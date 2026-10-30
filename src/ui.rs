@@ -20,7 +20,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::{App, CiRun, Focus, RunProfile, TargetStatusKind};
 use dialogs::{
     render_create_project_dialog, render_create_project_pending_dialog, render_delete_dialog,
-    render_help_dialog,
+    render_help_dialog, render_rename_project_dialog,
 };
 use format::{
     format_ci_time, format_count, format_duration, format_size, language_label_text, truncate,
@@ -160,6 +160,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     if app.creating_project {
         render_create_project_dialog(frame, app);
+    }
+
+    if app.renaming_project {
+        render_rename_project_dialog(frame, app);
     }
 
     if app.creating_project_in_background {

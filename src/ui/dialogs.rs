@@ -50,6 +50,30 @@ pub(super) fn render_create_project_dialog(frame: &mut Frame, app: &App) {
     frame.set_cursor_position((area.x + cursor as u16, area.y + 1));
 }
 
+pub(super) fn render_rename_project_dialog(frame: &mut Frame, app: &App) {
+    let area = centered_rect(frame.area(), 56, 3);
+    let width = area.width.saturating_sub(2) as usize;
+    let scroll = app.rename_project_input.visual_scroll(width);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(app.rename_project_input.value())
+            .alignment(Alignment::Left)
+            .scroll((0, scroll as u16))
+            .block(
+                Block::bordered()
+                    .title("Rename Cargo Project")
+                    .title_alignment(Alignment::Center)
+                    .border_type(BorderType::Rounded),
+            )
+            .style(Style::default().fg(Color::White).bg(Color::Black)),
+        area,
+    );
+
+    let cursor = app.rename_project_input.visual_cursor().max(scroll) - scroll + 1;
+    frame.set_cursor_position((area.x + cursor as u16, area.y + 1));
+}
+
 pub(super) fn render_create_project_pending_dialog(frame: &mut Frame) {
     let area = centered_rect(frame.area(), 40, 3);
     frame.render_widget(Clear, area);
@@ -83,9 +107,8 @@ Actions\n\
   Enter            Open project / run target / open CI run\n\
   O                Open project without switching to its tab\n\
   +                Open project in a Vibe tab\n\
-  a, b, c, d       Add, bookmark, clean, delete project\n\
-  e                Edit selected target\n\
-  q                Close selected running target\n\
+  a, b, c, d, r    Add, bookmark, clean, delete, rename project\n\
+  R                Refresh project discovery\n\
   Ctrl-r           Rescan selected project\n\
   Esc              Clear filters\n\
 \n\

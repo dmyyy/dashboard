@@ -364,13 +364,15 @@ impl App {
 
     // Adds streamed projects without resetting pending fuzzy work.
     pub(super) fn inject_project(&self, project: Project) {
-        self.project_matcher.injector().push(project, |project, cols| {
-            cols[0] = Utf32String::from(
-                format!("{} {}", project.name, project.path.display()).as_str(),
-            );
-            cols[1] = Utf32String::from(project.name.as_str());
-            cols[2] = Utf32String::from(project.path.to_string_lossy().as_ref());
-        });
+        self.project_matcher
+            .injector()
+            .push(project, |project, cols| {
+                cols[0] = Utf32String::from(
+                    format!("{} {}", project.name, project.path.display()).as_str(),
+                );
+                cols[1] = Utf32String::from(project.name.as_str());
+                cols[2] = Utf32String::from(project.path.to_string_lossy().as_ref());
+            });
     }
 
     pub(super) fn rebuild_target_matcher(&mut self) {
@@ -488,7 +490,11 @@ impl App {
                 })
                 .map_or(-1, |index| index as isize);
         } else {
-            self.cursor = if self.filtered_projects.is_empty() { -1 } else { 0 };
+            self.cursor = if self.filtered_projects.is_empty() {
+                -1
+            } else {
+                0
+            };
         }
         if self.cursor < 0 && !self.filtered_projects.is_empty() {
             self.cursor = 0;

@@ -65,6 +65,7 @@ pub struct App {
     pub confirm_delete_project: bool,
     pub show_help: bool,
     pub creating_project: bool,
+    pub renaming_project: bool,
     pub creating_project_in_background: bool,
     pub counter: u8,
     pub cursor: isize,
@@ -93,6 +94,7 @@ pub struct App {
     pub ci_input: Input,
     pub target_input: Input,
     pub create_project_input: Input,
+    pub rename_project_input: Input,
     pub filtered_projects: Vec<usize>,
     pub filtered_ci_runs: Vec<usize>,
     pub filtered_targets: Vec<usize>,
@@ -109,6 +111,9 @@ pub struct App {
     pub projects: Vec<Project>,
     pub recent_projects: RecentProjects,
     pub bookmarked_projects: BookmarkedProjects,
+    pub project_colors: HashMap<String, String>,
+    // Tracks the last generated project accent hue for distinct consecutive colors.
+    pub project_color_hue: f64,
     pub discovering_projects: bool,
     pub discovery_generation: u64,
     pub discovery_cancel: Option<Arc<AtomicBool>>,
@@ -132,6 +137,7 @@ impl Default for App {
             confirm_delete_project: false,
             show_help: false,
             creating_project: false,
+            renaming_project: false,
             creating_project_in_background: false,
             counter: 0,
             cursor: -1,
@@ -160,6 +166,7 @@ impl Default for App {
             ci_input: Input::default(),
             target_input: Input::default(),
             create_project_input: Input::default(),
+            rename_project_input: Input::default(),
             filtered_projects: Vec::new(),
             filtered_ci_runs: Vec::new(),
             filtered_targets: Vec::new(),
@@ -176,6 +183,8 @@ impl Default for App {
             projects: Vec::new(),
             recent_projects,
             bookmarked_projects,
+            project_colors: HashMap::new(),
+            project_color_hue: 0.0,
             discovering_projects: false,
             discovery_generation: 0,
             discovery_cancel: None,
@@ -281,9 +290,9 @@ impl App {
 
 #[cfg(test)]
 mod project_tests {
-    use super::{BackgroundResult, RecentProjects};
     use super::projects::{Project, discover_projects, discover_projects_streaming, sort_projects};
     use super::test_support::empty_app;
+    use super::{BackgroundResult, RecentProjects};
     use std::{
         collections::HashMap,
         fs,
@@ -380,8 +389,7 @@ mod project_tests {
         let root = TempDir::new();
         for name in ["older", "newer", "undiscovered"] {
             fs::create_dir(root.0.join(name)).expect("project directory");
-            fs::write(root.0.join(name).join("Cargo.toml"), "[package]")
-                .expect("project manifest");
+            fs::write(root.0.join(name).join("Cargo.toml"), "[package]").expect("project manifest");
         }
         let recents = RecentProjects {
             entries: HashMap::from([
@@ -491,7 +499,10 @@ mod project_tests {
 
         assert!(app.drain_background_results());
         app.sync_filtered_projects();
-        assert_eq!(app.current_project().map(|project| &project.path), Some(&older));
+        assert_eq!(
+            app.current_project().map(|project| &project.path),
+            Some(&older)
+        );
     }
 
     #[test]

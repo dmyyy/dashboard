@@ -25,6 +25,8 @@ toml = "0.9"
 portable-pty = "0.9"
 vt100 = "0.16"
 tui-term = "0.3.4"
+rand = "0.9"
+toml_edit = "0.23"
 
 # Read the optimization guideline for more details: https://ratatui.rs/recipes/apps/release-your-app/#optimizations
 [profile.release]

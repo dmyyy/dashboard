@@ -30,6 +30,22 @@ impl App {
             return Ok(());
         }
 
+        if self.renaming_project {
+            match key_event.code {
+                KeyCode::Esc => self.cancel_rename_project(),
+                KeyCode::Enter => self.confirm_rename_project()?,
+                KeyCode::Backspace
+                | KeyCode::Char(_)
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Delete => self.handle_rename_project_input(key_event),
+                _ => {}
+            }
+            return Ok(());
+        }
+
         if self.show_help {
             if matches!(key_event.code, KeyCode::Char('?') | KeyCode::Esc) {
                 self.show_help = false;
@@ -96,6 +112,16 @@ impl App {
                 if self.current_project().is_some() {
                     self.confirm_delete_project = true;
                 }
+            }
+            KeyCode::Char('r')
+                if self.focus == Focus::Projects && key_event.modifiers.is_empty() =>
+            {
+                self.start_rename_project()
+            }
+            KeyCode::Char('R')
+                if self.focus == Focus::Projects && key_event.modifiers == KeyModifiers::SHIFT =>
+            {
+                self.reload_projects()
             }
             KeyCode::Char('r' | 'R') if key_event.modifiers == KeyModifiers::CONTROL => {
                 self.rescan_selected_project()
@@ -279,13 +305,38 @@ impl App {
             self.create_project_input.handle(request);
         }
     }
+
+    // Applies standard line-editing requests to the project rename dialog.
+    pub(super) fn handle_rename_project_input(&mut self, key_event: KeyEvent) {
+        let request = match key_event.code {
+            KeyCode::Backspace => Some(InputRequest::DeletePrevChar),
+            KeyCode::Left => Some(InputRequest::GoToPrevChar),
+            KeyCode::Right => Some(InputRequest::GoToNextChar),
+            KeyCode::Home => Some(InputRequest::GoToStart),
+            KeyCode::End => Some(InputRequest::GoToEnd),
+            KeyCode::Delete => Some(InputRequest::DeleteNextChar),
+            KeyCode::Char(c)
+                if key_event.modifiers.is_empty() || key_event.modifiers == KeyModifiers::SHIFT =>
+            {
+                Some(InputRequest::InsertChar(c))
+            }
+            _ => None,
+        };
+        if let Some(request) = request {
+            self.rename_project_input.handle(request);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::Focus;
-    use crate::app::test_support::empty_app;
+    use crate::app::{projects::Project, test_support::empty_app};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::{
+        fs,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn refactor_input_editing_parity() {
@@ -387,5 +438,75 @@ mod tests {
         app.handle_key_events(escape).unwrap();
         assert!(!app.filter_mode);
         assert!(app.project_query.is_empty());
+    }
+
+    #[tokio::test]
+    async fn uppercase_r_discovers_projects_created_after_startup() {
+        let root = std::env::temp_dir().join(format!(
+            "dashboard-refresh-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let project_path = root.join("new-project");
+        fs::create_dir_all(&project_path).unwrap();
+        fs::write(
+            project_path.join("Cargo.toml"),
+            "[package]\nname = \"new-project\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let mut app = empty_app();
+        app.projects_root = root.clone();
+
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT))
+            .unwrap();
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            app.tick();
+            if !app.discovering_projects {
+                break;
+            }
+        }
+
+        assert!(
+            app.projects
+                .iter()
+                .any(|project| project.path == project_path)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lowercase_r_opens_a_prefilled_cargo_project_rename_dialog() {
+        let project_path = std::env::temp_dir().join(format!(
+            "dashboard-rename-input-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&project_path).unwrap();
+        fs::write(
+            project_path.join("Cargo.toml"),
+            "[package]\nname = \"old\"\n",
+        )
+        .unwrap();
+        let mut app = empty_app();
+        app.projects = vec![Project {
+            name: "old".to_owned(),
+            path: project_path.clone(),
+            has_git_dir: false,
+            is_workspace: false,
+        }];
+        app.filtered_projects = vec![0];
+        app.cursor = 0;
+
+        app.handle_key_events(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(app.renaming_project);
+        assert_eq!(app.rename_project_input.value(), "old");
+        fs::remove_dir_all(project_path).unwrap();
     }
 }

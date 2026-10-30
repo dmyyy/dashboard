@@ -11,6 +11,7 @@ Terminal dashboard for browsing local Rust projects, opening them in Zellij, and
 - Shows project metadata, git branch/status, size, language stats, and recent GitHub Actions runs
 - Discovers Cargo **bin**, **example**, **test**, and **bench** targets
 - Lets you **open** a project, **run** a target in a Zellij pane, or **explore/edit** the target source
+- Gives each opened project a hue-shifted accent shared by its in-memory IDE and Vibe layouts for that dashboard session; each new accent advances 120–240° from the last
 
 ## Installation
 
@@ -56,6 +57,8 @@ Follow the interactive prompts to sign in to GitHub.com. Then start dashboard wi
 - `a` — add project (`cargo new`) or clone from git URL
 - `b` — toggle bookmark
 - `d` — delete project (with confirmation)
+- `r` — rename a Cargo project directory and its package name
+- `R` — refresh project discovery
 - `/` — search projects
 - `Backspace` — delete from active project filter without entering search mode
 

@@ -186,7 +186,6 @@ impl App {
         }
     }
 
-
     pub(super) fn request_next_git_status_batch(&mut self, batch_size: usize) {
         if self.projects.is_empty() {
             return;

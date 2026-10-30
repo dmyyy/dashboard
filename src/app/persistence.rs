@@ -15,8 +15,7 @@ pub(crate) struct RecentProjects {
 pub(crate) struct BookmarkedProjects {
     pub(crate) entries: HashSet<String>,
 }
-
-fn dashboard_state_dir() -> PathBuf {
+pub(super) fn dashboard_state_dir() -> PathBuf {
     env::var("XDG_STATE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| expand_tilde(PathBuf::from("~/.local/state")))
