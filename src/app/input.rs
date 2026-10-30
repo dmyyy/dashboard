@@ -121,7 +121,7 @@ impl App {
             KeyCode::Char('R')
                 if self.focus == Focus::Projects && key_event.modifiers == KeyModifiers::SHIFT =>
             {
-                self.reload_projects()
+                self.refresh_project_discovery()
             }
             KeyCode::Char('r' | 'R') if key_event.modifiers == KeyModifiers::CONTROL => {
                 self.rescan_selected_project()
@@ -247,6 +247,9 @@ impl App {
                 self.open_selected_project(true)?
             }
             KeyCode::Char('+') if self.focus == Focus::Projects => self.open_selected_vibe_tab()?,
+            KeyCode::Char(' ') if self.focus == Focus::Projects => {
+                self.toggle_selected_project_worktrees()
+            }
             KeyCode::Char('e') if self.focus == Focus::Targets => self.edit_selected_target()?,
             _ => {}
         }
@@ -335,6 +338,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::{
         fs,
+        path::PathBuf,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
@@ -449,15 +453,30 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let existing_path = root.join("existing-project");
         let project_path = root.join("new-project");
-        fs::create_dir_all(&project_path).unwrap();
-        fs::write(
-            project_path.join("Cargo.toml"),
-            "[package]\nname = \"new-project\"\nversion = \"0.1.0\"\n",
-        )
-        .unwrap();
+        for (path, name) in [
+            (&existing_path, "existing-project"),
+            (&project_path, "new-project"),
+        ] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(
+                path.join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+            )
+            .unwrap();
+        }
         let mut app = empty_app();
         app.projects_root = root.clone();
+        app.projects = vec![Project {
+            name: "existing-project".to_owned(),
+            path: existing_path.clone(),
+            has_git_dir: false,
+            is_workspace: false,
+        }];
+        app.recent_projects
+            .entries
+            .insert(existing_path.to_string_lossy().into_owned(), u64::MAX - 1);
 
         app.handle_key_events(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT))
             .unwrap();
@@ -469,10 +488,14 @@ mod tests {
             }
         }
 
+        assert_eq!(app.projects.first().unwrap().path, project_path);
+        assert_eq!(app.projects[app.filtered_projects[0]].path, project_path);
+        assert_eq!(app.recently_discovered.get(&project_path), Some(&u64::MAX));
+        assert!(app.is_recently_discovered(app.projects.first().unwrap()));
         assert!(
-            app.projects
-                .iter()
-                .any(|project| project.path == project_path)
+            !app.recent_projects
+                .entries
+                .contains_key(project_path.to_string_lossy().as_ref())
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -508,5 +531,41 @@ mod tests {
         assert!(app.renaming_project);
         assert_eq!(app.rename_project_input.value(), "old");
         fs::remove_dir_all(project_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn space_toggles_selected_project_worktrees() {
+        let parent = PathBuf::from("/projects/dashboard");
+        let mut app = empty_app();
+        app.projects = vec![
+            Project {
+                name: "dashboard".to_owned(),
+                path: parent.clone(),
+                has_git_dir: true,
+                is_workspace: false,
+            },
+            Project {
+                name: "feature".to_owned(),
+                path: parent.join(".worktrees/feature"),
+                has_git_dir: true,
+                is_workspace: false,
+            },
+        ];
+        app.filtered_projects = vec![0, 1];
+        app.cursor = 0;
+        let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+
+        app.handle_key_events(space).unwrap();
+
+        assert_eq!(app.filtered_projects, vec![0]);
+        assert!(
+            app.minimized_worktree_projects
+                .contains(&PathBuf::from("/projects/dashboard"))
+        );
+
+        app.handle_key_events(space).unwrap();
+
+        assert_eq!(app.filtered_projects, vec![0, 1]);
+        assert!(app.minimized_worktree_projects.is_empty());
     }
 }

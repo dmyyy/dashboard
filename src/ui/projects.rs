@@ -97,7 +97,12 @@ pub(super) fn render_projects(frame: &mut Frame, app: &mut App, area: Rect) {
                     base_style
                 };
 
-                let last_opened = app.project_last_opened(&project);
+                let recency = app.project_recency(&project);
+                let recency_style = if app.is_recently_discovered(&project) && !is_selected {
+                    base_style.fg(Color::Green)
+                } else {
+                    base_style
+                };
                 let bookmark = if app.is_bookmarked(&project) {
                     "🌟"
                 } else {
@@ -108,11 +113,20 @@ pub(super) fn render_projects(frame: &mut Frame, app: &mut App, area: Rect) {
                     &app.project_matcher.pattern,
                     base_style,
                 );
+                let mut name = matched[0].clone();
+                if project.is_worktree() {
+                    // Keep linked worktrees visually subordinate to their parent project.
+                    let worktree_style = base_style.fg(INACTIVE_TEXT_COLOR);
+                    for span in &mut name.spans {
+                        span.style = worktree_style;
+                    }
+                    name.spans.insert(0, Span::styled("├ ", worktree_style));
+                }
                 Row::new(vec![
                     Cell::from(bookmark),
-                    Cell::from(matched[0].clone()).style(name_style),
+                    Cell::from(name).style(name_style),
                     Cell::from(size_text).style(size_style),
-                    Cell::from(last_opened),
+                    Cell::from(recency).style(recency_style),
                 ])
                 .style(base_style)
             })
@@ -129,7 +143,7 @@ pub(super) fn render_projects(frame: &mut Frame, app: &mut App, area: Rect) {
                 ],
             )
             .header(
-                Row::new(vec!["", "Name", "Size", "Last Opened"])
+                Row::new(vec!["", "Name", "Size", "Recency"])
                     .style(Style::default().add_modifier(Modifier::BOLD)),
             )
             .block(

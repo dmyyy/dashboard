@@ -2,7 +2,7 @@ use super::persistence::{RecentProjects, save_bookmarked_projects, save_recent_p
 use super::{App, BackgroundResult, Focus, Target, shell_escape_arg, shell_escape_path};
 use rand::Rng;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -19,6 +19,18 @@ pub(crate) struct Project {
     pub(crate) path: PathBuf,
     pub(crate) has_git_dir: bool,
     pub(crate) is_workspace: bool,
+}
+
+impl Project {
+    // Identifies repositories stored in a project's conventional .worktrees directory.
+    pub(crate) fn is_worktree(&self) -> bool {
+        self.worktree_parent().is_some()
+    }
+
+    // Returns the owning project directory for a direct child of .worktrees.
+    pub(crate) fn worktree_parent(&self) -> Option<&Path> {
+        worktree_parent_path(&self.path)
+    }
 }
 
 impl App {
@@ -157,6 +169,11 @@ impl App {
         if let Some(color) = self.project_colors.remove(&old_key) {
             self.project_colors.insert(new_key, color);
         }
+
+        if let Some(timestamp) = self.recently_discovered.remove(old_path) {
+            self.recently_discovered
+                .insert(new_path.to_path_buf(), timestamp);
+        }
         let _ = save_recent_projects(&self.recent_projects);
         let _ = save_bookmarked_projects(&self.bookmarked_projects);
 
@@ -187,6 +204,13 @@ impl App {
         }
         self.rebuild_project_matcher();
         self.refresh_targets();
+    }
+
+    // Refreshes discovery and highlights projects that were absent before this scan.
+    pub(super) fn refresh_project_discovery(&mut self) {
+        self.recently_discovered.clear();
+        self.mark_new_discoveries = true;
+        self.reload_projects();
     }
 
     pub(super) fn reload_projects(&mut self) {
@@ -249,6 +273,31 @@ impl App {
             self.bookmarked_projects.entries.remove(&key);
         }
         let _ = save_bookmarked_projects(&self.bookmarked_projects);
+    }
+
+    // Toggles visibility of the selected project's linked worktree rows.
+    pub(super) fn toggle_selected_project_worktrees(&mut self) {
+        let Some(project) = self.current_project() else {
+            return;
+        };
+        let project_path = project.path.clone();
+        if project.is_worktree()
+            || !self
+                .projects
+                .iter()
+                .any(|candidate| candidate.worktree_parent() == Some(project_path.as_path()))
+        {
+            return;
+        }
+
+        if !self
+            .minimized_worktree_projects
+            .insert(project_path.clone())
+        {
+            self.minimized_worktree_projects.remove(&project_path);
+        }
+        self.sync_filtered_projects();
+        self.refresh_targets();
     }
 
     pub(super) fn clean_selected_project(&mut self) {
@@ -383,6 +432,7 @@ impl App {
         self.recent_projects
             .entries
             .insert(key, unix_timestamp_now());
+        self.recently_discovered.remove(project_path);
         let _ = save_recent_projects(&self.recent_projects);
 
         let selected_path = self.current_project().map(|project| project.path.clone());
@@ -425,8 +475,15 @@ fn rename_cargo_project(old_path: &Path, new_path: &Path, name: &str) -> color_e
     fs::rename(old_path, new_path)?;
     Ok(())
 }
+// Formats legacy second timestamps and current millisecond timestamps as dates.
 pub(super) fn format_timestamp(timestamp: u64) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp as i64, 0)
+    const MILLIS_THRESHOLD: u64 = 100_000_000_000;
+    let seconds = if timestamp >= MILLIS_THRESHOLD {
+        timestamp / 1_000
+    } else {
+        timestamp
+    };
+    chrono::DateTime::<chrono::Utc>::from_timestamp(seconds as i64, 0)
         .map(|dt| {
             dt.with_timezone(&chrono::Local)
                 .format("%Y-%m-%d")
@@ -435,15 +492,127 @@ pub(super) fn format_timestamp(timestamp: u64) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
-fn unix_timestamp_now() -> u64 {
+// Uses milliseconds so openings within the same day retain their true order.
+pub(super) fn unix_timestamp_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
+        .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
 }
 
-pub(super) fn sort_projects(projects: &mut [Project], recent_projects: &RecentProjects) {
+pub(super) fn sort_projects(projects: &mut Vec<Project>, recent_projects: &RecentProjects) {
     projects.sort_by(|a, b| compare_projects(a, b, recent_projects));
+    group_worktrees(projects);
+}
+
+// Sorts a refresh using transient discovery timestamps before persisted last-opened dates.
+pub(super) fn sort_projects_with_discoveries(
+    projects: &mut Vec<Project>,
+    recent_projects: &RecentProjects,
+    recently_discovered: &std::collections::HashMap<PathBuf, u64>,
+) {
+    projects.sort_by(|a, b| {
+        compare_projects_with_discoveries(a, b, recent_projects, recently_discovered)
+    });
+    group_worktrees(projects);
+}
+
+// Places each .worktrees repository immediately after its discovered parent project.
+fn group_worktrees(projects: &mut Vec<Project>) {
+    let project_paths: HashSet<_> = projects
+        .iter()
+        .map(|project| project.path.clone())
+        .collect();
+    let mut children = HashMap::<PathBuf, Vec<Project>>::new();
+    let mut roots = Vec::with_capacity(projects.len());
+
+    for project in std::mem::take(projects) {
+        if let Some(parent) = worktree_parent_path(&project.path)
+            && project_paths.contains(parent)
+        {
+            children
+                .entry(parent.to_path_buf())
+                .or_default()
+                .push(project);
+        } else {
+            roots.push(project);
+        }
+    }
+
+    for project in roots {
+        let path = project.path.clone();
+        projects.push(project);
+        if let Some(children) = children.remove(&path) {
+            projects.extend(children);
+        }
+    }
+}
+
+// Preserves parent-child adjacency when a filtered project list is independently sorted.
+pub(super) fn group_worktree_indices(projects: &[Project], indices: &mut Vec<usize>) {
+    let project_paths: HashSet<_> = indices
+        .iter()
+        .filter_map(|&index| projects.get(index).map(|project| project.path.as_path()))
+        .collect();
+    let mut children = HashMap::<&Path, Vec<usize>>::new();
+    let mut roots = Vec::with_capacity(indices.len());
+
+    for index in std::mem::take(indices) {
+        let Some(project) = projects.get(index) else {
+            continue;
+        };
+        if let Some(parent) = worktree_parent_path(&project.path)
+            && project_paths.contains(parent)
+        {
+            children.entry(parent).or_default().push(index);
+        } else {
+            roots.push(index);
+        }
+    }
+
+    for index in roots {
+        let Some(project) = projects.get(index) else {
+            continue;
+        };
+        indices.push(index);
+        if let Some(children) = children.remove(project.path.as_path()) {
+            indices.extend(children);
+        }
+    }
+}
+
+// Returns the owning project directory for a direct child of .worktrees.
+fn worktree_parent_path(path: &Path) -> Option<&Path> {
+    (path.parent()?.file_name()? == ".worktrees").then(|| path.parent()?.parent())?
+}
+
+// Compares projects using transient discovery recency before persisted last-opened dates.
+pub(super) fn compare_projects_with_discoveries(
+    a: &Project,
+    b: &Project,
+    recent_projects: &RecentProjects,
+    recently_discovered: &std::collections::HashMap<PathBuf, u64>,
+) -> std::cmp::Ordering {
+    let a_recent = recently_discovered.get(&a.path).copied().or_else(|| {
+        recent_projects
+            .entries
+            .get(a.path.to_string_lossy().as_ref())
+            .copied()
+    });
+    let b_recent = recently_discovered.get(&b.path).copied().or_else(|| {
+        recent_projects
+            .entries
+            .get(b.path.to_string_lossy().as_ref())
+            .copied()
+    });
+    b_recent
+        .cmp(&a_recent)
+        .then_with(|| match (a_recent, b_recent) {
+            (None, None) => b.has_git_dir.cmp(&a.has_git_dir),
+            _ => std::cmp::Ordering::Equal,
+        })
+        .then_with(|| a.name.cmp(&b.name))
+        .then_with(|| a.path.cmp(&b.path))
 }
 
 pub(super) fn compare_projects(
@@ -601,7 +770,9 @@ fn inspect_directory(
             }
             continue;
         }
-        if name == "Cargo.toml" {
+        if name == ".git" {
+            has_git_dir = true;
+        } else if name == "Cargo.toml" {
             has_cargo_toml = true;
         }
     }
@@ -627,7 +798,7 @@ fn inspect_directory(
     })
 }
 
-// Workspace roots are project rows but terminate recursive discovery.
+// Workspace roots terminate discovery except for their conventional .worktrees directory.
 fn is_workspace_root(dir: &Path) -> bool {
     fs::read_to_string(dir.join("Cargo.toml"))
         .is_ok_and(|contents| contents.contains("[workspace]"))
@@ -652,11 +823,17 @@ fn visit_dirs_streaming(
             return false;
         }
     }
-    if scan.is_workspace {
-        return true;
-    }
+    // Preserve workspace boundaries while allowing their linked worktrees to be discovered.
+    let children = if scan.is_workspace {
+        scan.children
+            .into_iter()
+            .filter(|(child, _)| child.file_name().is_some_and(|name| name == ".worktrees"))
+            .collect()
+    } else {
+        scan.children
+    };
 
-    for (child, is_symlink) in scan.children {
+    for (child, is_symlink) in children {
         if cancelled.load(Ordering::Relaxed) {
             return false;
         }
@@ -750,14 +927,22 @@ impl App {
         self.bookmarked_projects.entries.contains(key.as_ref())
     }
 
-    pub fn project_last_opened(&self, project: &Project) -> String {
-        let key = project.path.to_string_lossy();
-        self.recent_projects
-            .entries
-            .get(key.as_ref())
+    pub fn project_recency(&self, project: &Project) -> String {
+        self.recently_discovered
+            .get(&project.path)
             .copied()
+            .or_else(|| {
+                self.recent_projects
+                    .entries
+                    .get(project.path.to_string_lossy().as_ref())
+                    .copied()
+            })
             .map(format_timestamp)
             .unwrap_or_else(|| "—".to_string())
+    }
+
+    pub fn is_recently_discovered(&self, project: &Project) -> bool {
+        self.recently_discovered.contains_key(&project.path)
     }
 
     pub fn cached_project_size_bytes(&self, project: &Project) -> Option<u64> {
@@ -769,7 +954,7 @@ impl App {
         };
 
         let project_path = project.path.clone();
-        let project_name = shell_escape_arg(&project.name);
+        let project_name = shell_escape_arg(&project_tab_name(project, ""));
         let cwd = shell_escape_path(&project_path);
         let layout = shell_escape_arg(&self.rendered_layout_string("ide", &project_path)?);
         let pane_focus = if no_focus { " --no-focus" } else { "" };
@@ -802,7 +987,7 @@ impl App {
 
         let project_path = project.path.clone();
         let cwd = shell_escape_path(&project_path);
-        let tab_name = shell_escape_arg(&format!("{}☆", project.name));
+        let tab_name = shell_escape_arg(&project_tab_name(project, "☆"));
         let layout = shell_escape_arg(&self.rendered_layout_string("vibe", &project_path)?);
         // Start the Vibe layout in a tab rooted at the selected project.
         let command =
@@ -874,6 +1059,12 @@ impl App {
     }
 }
 
+// Prefixes tabs opened from a linked worktree without changing the project display name.
+fn project_tab_name(project: &Project, suffix: &str) -> String {
+    let marker = if project.is_worktree() { "󰙨 " } else { "" };
+    format!("{marker}{}{suffix}", project.name)
+}
+
 // Advances by a broad random offset while avoiding green accents that clash with magenta.
 fn random_accent_color(previous_hue: &mut f64) -> String {
     let mut rng = rand::rng();
@@ -928,11 +1119,14 @@ fn linear_to_srgb(component: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{clashes_with_magenta, random_accent_color, rename_cargo_project};
-    use crate::app::test_support::empty_app;
+    use super::{
+        Project, clashes_with_magenta, format_timestamp, project_tab_name, random_accent_color,
+        rename_cargo_project, sort_projects, unix_timestamp_now,
+    };
+    use crate::app::{RecentProjects, test_support::empty_app};
     use std::{
         fs,
-        path::Path,
+        path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -981,6 +1175,56 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(app.project_colors.len(), 1);
+    }
+
+    #[test]
+    fn formats_precise_recency_as_a_date_and_records_milliseconds() {
+        let seconds = 1_700_000_000;
+
+        assert_eq!(
+            format_timestamp(seconds * 1_000 + 999),
+            format_timestamp(seconds)
+        );
+        assert!(unix_timestamp_now() >= 100_000_000_000);
+    }
+
+    #[test]
+    fn keeps_worktrees_grouped_beneath_their_project_and_marks_tab_names() {
+        let parent = PathBuf::from("/projects/dashboard");
+        let worktree = parent.join(".worktrees/feature");
+        let mut projects = vec![
+            Project {
+                name: "feature".to_owned(),
+                path: worktree,
+                has_git_dir: true,
+                is_workspace: false,
+            },
+            Project {
+                name: "z-other".to_owned(),
+                path: PathBuf::from("/projects/z-other"),
+                has_git_dir: true,
+                is_workspace: false,
+            },
+            Project {
+                name: "dashboard".to_owned(),
+                path: parent,
+                has_git_dir: true,
+                is_workspace: false,
+            },
+        ];
+
+        sort_projects(&mut projects, &RecentProjects::default());
+
+        assert_eq!(
+            projects
+                .iter()
+                .map(|project| project.name.as_str())
+                .collect::<Vec<_>>(),
+            ["dashboard", "feature", "z-other"]
+        );
+        assert!(projects[1].is_worktree());
+        assert_eq!(project_tab_name(&projects[1], ""), "󰙨 feature");
+        assert_eq!(project_tab_name(&projects[0], "☆"), "dashboard☆");
     }
 
     #[test]

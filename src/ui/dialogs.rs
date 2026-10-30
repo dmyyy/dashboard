@@ -92,7 +92,7 @@ pub(super) fn render_create_project_pending_dialog(frame: &mut Frame) {
 }
 
 pub(super) fn render_help_dialog(frame: &mut Frame) {
-    let area = centered_rect(frame.area(), 62, 18);
+    let area = centered_rect(frame.area(), 62, 19);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(
@@ -107,9 +107,9 @@ Actions\n\
   Enter            Open project / run target / open CI run\n\
   O                Open project without switching to its tab\n\
   +                Open project in a Vibe tab\n\
+  Space            Expand / minimize project worktrees\n\
   a, b, c, d, r    Add, bookmark, clean, delete, rename project\n\
   R                Refresh project discovery\n\
-  Ctrl-r           Rescan selected project\n\
   Esc              Clear filters\n\
 \n\
 ? / Esc            Close this help",

@@ -109,6 +109,8 @@ pub struct App {
     pub pending_g: bool,
     pub projects_root: PathBuf,
     pub projects: Vec<Project>,
+    // Stores project paths whose linked worktree rows are hidden.
+    pub minimized_worktree_projects: HashSet<PathBuf>,
     pub recent_projects: RecentProjects,
     pub bookmarked_projects: BookmarkedProjects,
     pub project_colors: HashMap<String, String>,
@@ -118,6 +120,8 @@ pub struct App {
     pub discovery_generation: u64,
     pub discovery_cancel: Option<Arc<AtomicBool>>,
     pub discovery_seen: HashSet<PathBuf>,
+    pub recently_discovered: HashMap<PathBuf, u64>,
+    pub mark_new_discoveries: bool,
     pub background_tx: mpsc::UnboundedSender<BackgroundResult>,
     pub background_rx: mpsc::UnboundedReceiver<BackgroundResult>,
     pub background_limiter: Arc<Semaphore>,
@@ -181,6 +185,7 @@ impl Default for App {
             pending_g: false,
             projects_root,
             projects: Vec::new(),
+            minimized_worktree_projects: HashSet::new(),
             recent_projects,
             bookmarked_projects,
             project_colors: HashMap::new(),
@@ -189,6 +194,8 @@ impl Default for App {
             discovery_generation: 0,
             discovery_cancel: None,
             discovery_seen: HashSet::new(),
+            recently_discovered: HashMap::new(),
+            mark_new_discoveries: false,
             background_tx,
             background_rx,
             background_limiter: Arc::new(Semaphore::new(8)),
@@ -337,6 +344,14 @@ mod project_tests {
         fs::write(root.0.join("workspace/Cargo.toml"), "[workspace]").expect("workspace manifest");
         fs::write(root.0.join("workspace/member/Cargo.toml"), "[package]")
             .expect("member manifest");
+        // A linked worktree uses a .git file rather than a .git directory.
+        fs::create_dir_all(root.0.join("workspace/.worktrees/feature"))
+            .expect("worktree directory");
+        fs::write(
+            root.0.join("workspace/.worktrees/feature/.git"),
+            "gitdir: /fixture/worktrees/feature",
+        )
+        .expect("worktree git marker");
         fs::create_dir_all(root.0.join("target/hidden")).expect("target directory");
         fs::write(root.0.join("target/hidden/Cargo.toml"), "[package]").expect("hidden manifest");
 
@@ -347,7 +362,12 @@ mod project_tests {
             .collect();
         assert_eq!(
             names,
-            std::collections::HashSet::from(["git-project", "cargo-project", "workspace"])
+            std::collections::HashSet::from([
+                "git-project",
+                "cargo-project",
+                "workspace",
+                "feature"
+            ])
         );
         assert!(
             projects
@@ -359,11 +379,16 @@ mod project_tests {
                 .iter()
                 .any(|project| project.name == "workspace" && project.is_workspace)
         );
+        assert!(
+            projects
+                .iter()
+                .any(|project| project.name == "feature" && project.is_worktree())
+        );
         assert!(discover_projects(&root.0.join("missing")).is_empty());
     }
 
     #[test]
-    fn refactor_projects_recent_order() {
+    fn orders_projects_opened_on_the_same_day_by_millisecond_recency() {
         let root = TempDir::new();
         for name in ["older", "newer", "git-a", "plain-a", "plain-b"] {
             fs::create_dir(root.0.join(name)).expect("project directory");
@@ -372,8 +397,14 @@ mod project_tests {
         fs::create_dir(root.0.join("git-a/.git")).expect("git marker");
         let mut projects = discover_projects(&root.0);
         let mut entries = HashMap::new();
-        entries.insert(root.0.join("older").to_string_lossy().into_owned(), 10);
-        entries.insert(root.0.join("newer").to_string_lossy().into_owned(), 20);
+        entries.insert(
+            root.0.join("older").to_string_lossy().into_owned(),
+            1_700_000_000_001,
+        );
+        entries.insert(
+            root.0.join("newer").to_string_lossy().into_owned(),
+            1_700_000_000_002,
+        );
         sort_projects(&mut projects, &RecentProjects { entries });
         assert_eq!(
             projects

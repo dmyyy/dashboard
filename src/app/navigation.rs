@@ -459,12 +459,14 @@ impl App {
         if self.project_query.is_empty() {
             self.filtered_projects = (0..self.projects.len()).collect();
             self.filtered_projects.sort_by(|&a, &b| {
-                super::projects::compare_projects(
+                super::projects::compare_projects_with_discoveries(
                     &self.projects[a],
                     &self.projects[b],
                     &self.recent_projects,
+                    &self.recently_discovered,
                 )
             });
+            super::projects::group_worktree_indices(&self.projects, &mut self.filtered_projects);
         } else {
             self.filtered_projects = self
                 .project_matcher
@@ -478,6 +480,15 @@ impl App {
                 })
                 .collect();
         }
+
+        // Hide linked worktrees only when their parent project is minimized.
+        self.filtered_projects.retain(|&index| {
+            self.projects.get(index).is_some_and(|project| {
+                project
+                    .worktree_parent()
+                    .is_none_or(|parent| !self.minimized_worktree_projects.contains(parent))
+            })
+        });
 
         if let Some(selected_path) = selected_path {
             self.cursor = self
@@ -656,5 +667,39 @@ mod tests {
         app.target_query = "%k bin %n dashboard %p src".to_owned();
         app.update_target_filter();
         assert_eq!(app.filtered_targets, vec![0]);
+    }
+
+    #[test]
+    fn keeps_worktrees_adjacent_to_their_parent_without_a_search_query() {
+        let mut app = empty_app();
+        app.projects = vec![
+            Project {
+                name: "abcdefg".to_owned(),
+                path: PathBuf::from("/work/abcdefg"),
+                has_git_dir: true,
+                is_workspace: false,
+            },
+            Project {
+                name: "feature".to_owned(),
+                path: PathBuf::from("/work/z-parent/.worktrees/feature"),
+                has_git_dir: true,
+                is_workspace: false,
+            },
+            Project {
+                name: "z-parent".to_owned(),
+                path: PathBuf::from("/work/z-parent"),
+                has_git_dir: true,
+                is_workspace: false,
+            },
+        ];
+
+        app.sync_filtered_projects();
+
+        assert_eq!(
+            app.visible_projects()
+                .map(|project| project.name.as_str())
+                .collect::<Vec<_>>(),
+            ["abcdefg", "z-parent", "feature"]
+        );
     }
 }

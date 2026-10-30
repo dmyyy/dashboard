@@ -1,4 +1,6 @@
-use super::projects::{Project, directory_size, sort_projects};
+use super::projects::{
+    Project, directory_size, sort_projects_with_discoveries, unix_timestamp_now,
+};
 use super::providers::{
     CiRunsData, LanguagesData, ProjectMetadataSummary, discover_ci_runs, discover_languages,
     discover_project_metadata, git_status,
@@ -96,6 +98,22 @@ impl App {
                             *existing = project;
                             continue;
                         }
+                        if self.mark_new_discoveries {
+                            let now = unix_timestamp_now();
+                            // Keep discovery-only recency ahead of all persisted last-opened dates.
+                            let recency = self
+                                .recent_projects
+                                .entries
+                                .values()
+                                .chain(self.recently_discovered.values())
+                                .copied()
+                                .max()
+                                .unwrap_or(0)
+                                .max(now.saturating_sub(1))
+                                .saturating_add(1);
+                            self.recently_discovered
+                                .insert(project.path.clone(), recency);
+                        }
                         self.inject_project(project.clone());
                         self.projects.push(project);
                         projects_changed = true;
@@ -106,10 +124,14 @@ impl App {
                 {
                     let selected_path = self.current_project().map(|project| project.path.clone());
                     self.discovering_projects = false;
+                    self.mark_new_discoveries = false;
                     self.projects
                         .retain(|project| self.discovery_seen.contains(&project.path));
-                    sort_projects(&mut self.projects, &self.recent_projects);
-                    self.rebuild_project_matcher();
+                    sort_projects_with_discoveries(
+                        &mut self.projects,
+                        &self.recent_projects,
+                        &self.recently_discovered,
+                    );
                     if let Some(selected_path) = selected_path {
                         self.cursor = self
                             .filtered_projects
